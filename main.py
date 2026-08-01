@@ -58,3 +58,7 @@ async def main():
         await bot_app.stop()
         await bot_app.shutdown()
         await userbot.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

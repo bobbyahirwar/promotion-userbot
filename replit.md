@@ -19,22 +19,18 @@ A Python project scaffolded with Pyrogram (Telegram MTProto client), Motor (asyn
 | `runtime.txt` | Specifies Python 3.11 runtime |
 
 ## Running the Project
-1. Create a `.env` file (see below) with your credentials.
-2. Run: `python main.py`
+The workflow **Start application** runs `python -u main.py` automatically.
 
-## Required Environment Variables
-Create a `.env` file in the project root:
-```
-API_ID=your_telegram_api_id
-API_HASH=your_telegram_api_hash
-BOT_TOKEN=your_bot_token
-MONGO_URI=mongodb://localhost:27017
-DB_NAME=mybot
-```
+## Required Secrets (set via Replit Secrets)
+| Variable | Source |
+|---|---|
+| `BOT_TOKEN` | @BotFather on Telegram |
+| `API_ID` | https://my.telegram.org |
+| `API_HASH` | https://my.telegram.org |
+| `SESSION_STRING` | Generated with Pyrogram on the userbot account |
+| `OWNER_ID` | Your Telegram numeric user ID |
+| `MONGO_URI` | MongoDB Atlas connection string |
 
-Get `API_ID` and `API_HASH` from https://my.telegram.org.
-Get `BOT_TOKEN` from @BotFather on Telegram.
-
-## User Preferences
-- Minimal scaffolding — no bot logic, just runnable project structure.
-- Files: main.py, config.py, requirements.txt, runtime.txt only.
+## Notes
+- `main.py` was missing `asyncio.run(main())` — added to fix the silent exit on startup.
+- `SESSION_STRING` must be a valid Pyrogram 2.0.106 session (271-byte decoded); see `config.py` for regeneration instructions if it fails validation.
