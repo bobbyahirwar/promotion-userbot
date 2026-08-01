@@ -25,6 +25,7 @@ async def main():
     try:
         await bot_app.initialize()
         await bot_app.start()
+        await bot_app.updater.start_polling()
         print("✅ Bot Connected")
     except Exception as e:
         print(f"❌ Bot failed to connect: {e}")
@@ -36,7 +37,9 @@ async def main():
         print("✅ User Session Connected")
     except Exception as e:
         print(f"❌ User Session failed to connect: {e}")
+        await bot_app.updater.stop()
         await bot_app.stop()
+        await bot_app.shutdown()
         sys.exit(1)
 
     # Connect MongoDB
@@ -47,9 +50,11 @@ async def main():
 
     print("✅ Promotion System Ready")
 
-    # Keep running
-    await asyncio.Event().wait()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    # Keep running until cancelled
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await bot_app.updater.stop()
+        await bot_app.stop()
+        await bot_app.shutdown()
+        await userbot.stop()

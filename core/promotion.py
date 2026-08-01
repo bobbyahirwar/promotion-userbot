@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from pyrogram.errors import (
     FloodWait,
-    SlowModeWait,
+    SlowmodeWait,
     ChatWriteForbidden,
     UserBannedInChannel,
     PeerIdInvalid,
