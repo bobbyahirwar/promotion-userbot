@@ -5,10 +5,24 @@ from datetime import datetime, timezone
 
 from pyrogram.errors import (
     FloodWait,
-    SlowmodeWait,       # correct Pyrogram name (lowercase 'm')
+    SlowmodeWait,           # correct Pyrogram name (lowercase 'm')
     ChatWriteForbidden,
     UserBannedInChannel,
     PeerIdInvalid,
+    ChatAdminRequired,
+    ChannelPrivate,
+    UserNotParticipant,
+)
+
+# Permanent permission errors that should deactivate a group.
+# Temporary errors (FloodWait, SlowmodeWait, network) are NOT listed here.
+_PERMANENT_ERRORS = (
+    ChatWriteForbidden,
+    UserBannedInChannel,
+    PeerIdInvalid,
+    ChatAdminRequired,
+    ChannelPrivate,
+    UserNotParticipant,
 )
 
 from database import get_db
@@ -91,15 +105,20 @@ async def _loop(bot):
         current_msg   = messages[cycle_msg_idx]
         print(f"📨 Cycle message: #{cycle_msg_idx + 1}/{len(messages)}")
 
-        # ── Blacklist filter ─────────────────────────────────────────────────
+        # ── Blacklist + inactive filter ──────────────────────────────────────
         from handlers.blacklist import get_blacklisted_ids
+        from handlers.inactive_groups import get_inactive_ids, mark_inactive
+
         blacklisted = await get_blacklisted_ids()
-        active_groups = [g for g in groups if g["chat_id"] not in blacklisted]
+        inactive    = await get_inactive_ids()
+        excluded    = blacklisted | inactive
+        active_groups = [g for g in groups if g["chat_id"] not in excluded]
 
         total_groups = len(active_groups)
         successful = 0
         skipped    = 0
         failed     = 0
+        deactivated = 0
 
         for i, group in enumerate(active_groups):
             if not _running:
@@ -124,37 +143,46 @@ async def _loop(bot):
                 msgs_sent = 1
 
             except FloodWait as e:
-                # Honour Telegram's required wait, then continue with next group
+                # Temporary — wait exactly as long as Telegram requires, then
+                # move on.  Never deactivate the group for this.
                 print(f"  ⚠️  FloodWait {e.value}s — waiting then resuming")
                 await _inc_stat(db, "total_failed")
                 group_result = "failed"
                 await asyncio.sleep(e.value)
 
             except SlowmodeWait as e:
+                # Temporary — skip this cycle, retry next time.
                 wait_time = getattr(e, "value", 30)
-                print(f"  ⚠️  SlowmodeWait {wait_time}s — skipping group")
+                print(f"  ⚠️  SlowmodeWait {wait_time}s — skipping group (temporary)")
                 await _inc_stat(db, "total_failed")
                 group_result = "skipped"
 
-            except (ChatWriteForbidden, UserBannedInChannel, PeerIdInvalid) as e:
-                print(f"  ⚠️  {type(e).__name__} — skipping group")
+            except _PERMANENT_ERRORS as e:
+                # Permanent permission error — deactivate immediately so the
+                # group is excluded from every future cycle.
+                reason = type(e).__name__
                 await _inc_stat(db, "total_failed")
-                group_result = "skipped"
+                await mark_inactive(chat_id, reason)
+                group_result = "inactive"
 
             except Exception as e:
-                print(f"  ⚠️  Error: {e} — continuing to next group")
+                # Temporary (network, timeout, unknown) — do NOT deactivate.
+                print(f"  ⚠️  Temporary error on {name}: {e} — continuing")
                 await _inc_stat(db, "total_failed")
                 group_result = "failed"
 
             # ── Per-group result line ────────────────────────────────────────
             if group_result == "ok":
-                label = f"Sent ({msgs_sent} msg{'s' if msgs_sent != 1 else ''})"
+                label = f"Sent (1 msg)"
                 successful += 1
             elif group_result == "skipped":
-                label = "Skipped"
+                label = "Skipped (temporary)"
                 skipped += 1
+            elif group_result == "inactive":
+                label = "Deactivated (permanent error)"
+                deactivated += 1
             else:
-                label = f"Failed (sent {msgs_sent} before error)"
+                label = "Failed (temporary)"
                 failed += 1
 
             print(f"[{i + 1}/{total_groups}] {name} -> {label}")
@@ -178,6 +206,7 @@ async def _loop(bot):
             f"   Successful   : {successful}\n"
             f"   Skipped      : {skipped}\n"
             f"   Failed       : {failed}\n"
+            f"   Deactivated  : {deactivated}\n"
             f"   Next message : #{next_idx + 1}\n"
         )
 

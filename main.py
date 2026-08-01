@@ -10,7 +10,7 @@ async def main():
     from core.bot import bot_app
     from core.userbot import userbot
     from database import init_db
-    from handlers import admin, messages, groups, promo, blacklist, stats
+    from handlers import admin, messages, groups, promo, blacklist, stats, inactive_groups
     from core.promotion import restore_state
 
     # Register handlers
@@ -20,6 +20,7 @@ async def main():
     promo.register(bot_app)
     blacklist.register(bot_app)
     stats.register(bot_app)
+    inactive_groups.register(bot_app)
 
     # Start Telegram Bot
     try:

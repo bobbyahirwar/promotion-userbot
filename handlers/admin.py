@@ -41,7 +41,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/removeblacklist <number> — Remove a group from the blacklist\n\n"
         "📣 Promotion\n"
         "/startpromo — Start automatic promotion\n"
-        "/stoppromo — Stop automatic promotion"
+        "/stoppromo — Stop automatic promotion\n\n"
+        "🚫 Inactive Groups\n"
+        "/inactivegroups — Show all auto-deactivated groups with reason\n"
+        "/reactivategroups — Reactivate all inactive groups\n"
+        "/reactivate <group_id> — Reactivate one group by ID"
     )
     await update.message.reply_text(text)
 
