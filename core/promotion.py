@@ -70,7 +70,7 @@ async def _loop(bot):
         cycle_start = asyncio.get_event_loop().time()
         db = get_db()
 
-        messages = await db.messages.find().to_list(5)
+        messages = await db.messages.find().to_list(100)
         if not messages:
             print("⚠️  No messages saved — waiting 5 minutes.")
             await asyncio.sleep(300)
@@ -82,12 +82,19 @@ async def _loop(bot):
             await asyncio.sleep(300)
             continue
 
+        # ── Rotating message selection ────────────────────────────────────────
+        # Load persisted index, pick one message for this entire cycle, then
+        # advance the pointer so the next cycle uses the following message.
+        idx_doc = await db.state.find_one({"key": "current_message_index"})
+        raw_idx = idx_doc["value"] if idx_doc and "value" in idx_doc else 0
+        cycle_msg_idx = int(raw_idx) % len(messages)
+        current_msg   = messages[cycle_msg_idx]
+        print(f"📨 Cycle message: #{cycle_msg_idx + 1}/{len(messages)}")
+
         # ── Blacklist filter ─────────────────────────────────────────────────
         from handlers.blacklist import get_blacklisted_ids
         blacklisted = await get_blacklisted_ids()
         active_groups = [g for g in groups if g["chat_id"] not in blacklisted]
-
-        random.shuffle(messages)
 
         total_groups = len(active_groups)
         successful = 0
@@ -107,18 +114,14 @@ async def _loop(bot):
             except Exception:
                 name = str(chat_id)
 
-            msgs_sent   = 0
+            msgs_sent    = 0
             # "ok" | "skipped" | "failed"
             group_result = "ok"
 
             try:
-                for idx, msg in enumerate(messages):
-                    await _send_one(bot, chat_id, msg)
-                    await _inc_stat(db, "total_sent")
-                    msgs_sent += 1
-                    # 1–2 s between messages inside the same group; none after last
-                    if idx < len(messages) - 1:
-                        await asyncio.sleep(random.uniform(1, 2))
+                await _send_one(bot, chat_id, current_msg)
+                await _inc_stat(db, "total_sent")
+                msgs_sent = 1
 
             except FloodWait as e:
                 # Honour Telegram's required wait, then continue with next group
@@ -164,12 +167,18 @@ async def _loop(bot):
         await _set_stat(db, "last_promotion_time",
                         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
+        # Advance the rotating index and persist it for the next cycle /
+        # restart.  Wraps via modulo when fetched at the top of the next cycle.
+        next_idx = (cycle_msg_idx + 1) % len(messages)
+        await _set_stat(db, "current_message_index", next_idx)
+
         print(
-            f"\n📊 Cycle complete:\n"
+            f"\n📊 Cycle complete (message #{cycle_msg_idx + 1}/{len(messages)}):\n"
             f"   Total Groups : {total_groups}\n"
             f"   Successful   : {successful}\n"
             f"   Skipped      : {skipped}\n"
             f"   Failed       : {failed}\n"
+            f"   Next message : #{next_idx + 1}\n"
         )
 
         # ── Exact 5-minute cadence: subtract time already spent ──────────────
