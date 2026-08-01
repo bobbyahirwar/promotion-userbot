@@ -1,13 +1,26 @@
 import os
+import sys
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Telegram API credentials
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+REQUIRED_VARS = [
+    "BOT_TOKEN",
+    "API_ID",
+    "API_HASH",
+    "SESSION_STRING",
+    "OWNER_ID",
+    "MONGO_URI",
+]
 
-# MongoDB
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-DB_NAME = os.getenv("DB_NAME", "mybot")
+missing = [var for var in REQUIRED_VARS if not os.getenv(var)]
+if missing:
+    print(f"❌ Missing required environment variables: {', '.join(missing)}")
+    sys.exit(1)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+SESSION_STRING = os.getenv("SESSION_STRING")
+OWNER_ID = int(os.getenv("OWNER_ID"))
+MONGO_URI = os.getenv("MONGO_URI")
