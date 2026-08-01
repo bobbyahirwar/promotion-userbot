@@ -91,7 +91,8 @@ async def _loop(bot):
 
         total_groups = len(active_groups)
         successful = 0
-        failed = 0
+        skipped    = 0
+        failed     = 0
 
         for i, group in enumerate(active_groups):
             if not _running:
@@ -99,66 +100,80 @@ async def _loop(bot):
 
             chat_id = group["chat_id"]
 
-            # Resolve display name
+            # Resolve display name — never let this block or crash the loop
             try:
                 chat = await userbot.get_chat(chat_id)
                 name = chat.title or str(chat_id)
             except Exception:
                 name = str(chat_id)
 
-            print(f"📤 [{i + 1}/{total_groups}] Sending to {name}")
+            msgs_sent   = 0
+            # "ok" | "skipped" | "failed"
+            group_result = "ok"
 
-            group_ok = True
             try:
                 for idx, msg in enumerate(messages):
                     await _send_one(bot, chat_id, msg)
                     await _inc_stat(db, "total_sent")
-                    print(f"  ✅ Sent message {idx + 1}/{len(messages)}")
+                    msgs_sent += 1
+                    # 1–2 s between messages inside the same group; none after last
                     if idx < len(messages) - 1:
-                        await asyncio.sleep(random.uniform(2, 3))
+                        await asyncio.sleep(random.uniform(1, 2))
 
             except FloodWait as e:
-                # Wait exactly as long as Telegram demands, then keep going
-                print(f"  ⚠️  FloodWait {e.value}s on {name} — waiting, then continuing")
+                # Honour Telegram's required wait, then continue with next group
+                print(f"  ⚠️  FloodWait {e.value}s — waiting then resuming")
                 await _inc_stat(db, "total_failed")
-                group_ok = False
+                group_result = "failed"
                 await asyncio.sleep(e.value)
+
             except SlowmodeWait as e:
                 wait_time = getattr(e, "value", 30)
-                print(f"  ⚠️  SlowmodeWait {wait_time}s on {name} — skipping")
+                print(f"  ⚠️  SlowmodeWait {wait_time}s — skipping group")
                 await _inc_stat(db, "total_failed")
-                group_ok = False
-            except (ChatWriteForbidden, UserBannedInChannel, PeerIdInvalid) as e:
-                print(f"  ⚠️  {type(e).__name__} on {name} — skipping")
-                await _inc_stat(db, "total_failed")
-                group_ok = False
-            except Exception as e:
-                print(f"  ⚠️  Network/unknown error on {name}: {e} — skipping")
-                await _inc_stat(db, "total_failed")
-                group_ok = False
+                group_result = "skipped"
 
-            if group_ok:
+            except (ChatWriteForbidden, UserBannedInChannel, PeerIdInvalid) as e:
+                print(f"  ⚠️  {type(e).__name__} — skipping group")
+                await _inc_stat(db, "total_failed")
+                group_result = "skipped"
+
+            except Exception as e:
+                print(f"  ⚠️  Error: {e} — continuing to next group")
+                await _inc_stat(db, "total_failed")
+                group_result = "failed"
+
+            # ── Per-group result line ────────────────────────────────────────
+            if group_result == "ok":
+                label = f"Sent ({msgs_sent} msg{'s' if msgs_sent != 1 else ''})"
                 successful += 1
+            elif group_result == "skipped":
+                label = "Skipped"
+                skipped += 1
             else:
+                label = f"Failed (sent {msgs_sent} before error)"
                 failed += 1
 
-            # Delay between groups: strictly 5–10s; skip after the last group
+            print(f"[{i + 1}/{total_groups}] {name} -> {label}")
+
+            # 3–5 s between groups; no delay after the very last group
             if _running and i < total_groups - 1:
-                await asyncio.sleep(random.uniform(5, 10))
+                await asyncio.sleep(random.uniform(3, 5))
 
         # ── End-of-cycle summary ─────────────────────────────────────────────
         await _set_stat(db, "last_promotion_time",
                         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
         print(
-            f"\n📊 Cycle Summary:\n"
+            f"\n📊 Cycle complete:\n"
             f"   Total Groups : {total_groups}\n"
             f"   Successful   : {successful}\n"
+            f"   Skipped      : {skipped}\n"
             f"   Failed       : {failed}\n"
         )
 
         # ── Exact 5-minute cadence: subtract time already spent ──────────────
-        elapsed = asyncio.get_event_loop().time() - cycle_start
+        elapsed   = asyncio.get_event_loop().time() - cycle_start
         remaining = max(0.0, 300.0 - elapsed)
         if _running and remaining > 0:
             print(f"⏳ Next cycle in {remaining:.0f}s.")
