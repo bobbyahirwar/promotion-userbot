@@ -33,19 +33,32 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/delmsg <number> — Delete a saved message\n"
         "/clearmsg — Delete all saved messages\n\n"
         "👥 Groups\n"
-        "/groups — Scan and list joined groups"
+        "/groups — Scan and list joined groups\n\n"
+        "📣 Promotion\n"
+        "/startpromo — Start automatic promotion\n"
+        "/stoppromo — Stop automatic promotion"
     )
     await update.message.reply_text(text)
 
 
 @owner_only
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from core.promotion import is_running
+    from database import get_db
+
+    db = get_db()
+    msg_count   = await db.messages.count_documents({})
+    group_count = await db.groups.count_documents({})
+    promo_line  = "🟢 Running" if is_running() else "🔴 Stopped"
+
     text = (
         "🤖 Promotion Userbot Status\n\n"
         "✅ Bot Connected\n"
         "✅ User Session Connected\n"
         "✅ MongoDB Connected\n\n"
-        "Promotion: Not Configured Yet"
+        f"Promotion: {promo_line}\n"
+        f"Groups: {group_count}\n"
+        f"Messages: {msg_count}"
     )
     await update.message.reply_text(text)
 

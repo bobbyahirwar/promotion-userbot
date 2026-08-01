@@ -10,12 +10,14 @@ async def main():
     from core.bot import bot_app
     from core.userbot import userbot
     from database import init_db
-    from handlers import admin, messages, groups
+    from handlers import admin, messages, groups, promo
+    from core.promotion import restore_state
 
     # Register handlers
     admin.register(bot_app)
     messages.register(bot_app)
     groups.register(bot_app)
+    promo.register(bot_app)
 
     # Start Telegram Bot
     try:
@@ -37,6 +39,9 @@ async def main():
 
     # Connect MongoDB
     await init_db()
+
+    # Resume promotion if it was running before restart
+    await restore_state(bot_app.bot)
 
     print("✅ Promotion System Ready")
 
