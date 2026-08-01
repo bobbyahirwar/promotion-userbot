@@ -9,6 +9,7 @@ print("✅ Configuration Loaded")
 async def main():
     from core.bot import bot_app
     from core.userbot import userbot
+    from database import init_db
 
     # Start Telegram Bot
     try:
@@ -27,6 +28,11 @@ async def main():
         print(f"❌ User Session failed to connect: {e}")
         await bot_app.stop()
         sys.exit(1)
+
+    # Connect MongoDB
+    await init_db()
+
+    print("✅ Promotion System Ready")
 
     # Keep running
     await asyncio.Event().wait()
