@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from pyrogram.errors import (
     FloodWait,
-    SlowmodeWait,
+    SlowmodeWait,       # correct Pyrogram name (lowercase 'm')
     ChatWriteForbidden,
     UserBannedInChannel,
     PeerIdInvalid,
@@ -67,6 +67,7 @@ async def _loop(bot):
     print("✅ Promotion Started")
 
     while _running:
+        cycle_start = asyncio.get_event_loop().time()
         db = get_db()
 
         messages = await db.messages.find().to_list(5)
@@ -86,12 +87,13 @@ async def _loop(bot):
         blacklisted = await get_blacklisted_ids()
         active_groups = [g for g in groups if g["chat_id"] not in blacklisted]
 
-        # ── Safe-sending cache (cleared each cycle) ──────────────────────────
-        sent_this_cycle: set[tuple[int, str]] = set()
-
         random.shuffle(messages)
 
-        for group in active_groups:
+        total_groups = len(active_groups)
+        successful = 0
+        failed = 0
+
+        for i, group in enumerate(active_groups):
             if not _running:
                 break
 
@@ -104,45 +106,63 @@ async def _loop(bot):
             except Exception:
                 name = str(chat_id)
 
-            print(f"📤 Sending to {name}")
+            print(f"📤 [{i + 1}/{total_groups}] Sending to {name}")
 
+            group_ok = True
             try:
                 for idx, msg in enumerate(messages):
-                    cache_key = (chat_id, str(msg["_id"]))
-                    if cache_key in sent_this_cycle:
-                        continue  # already sent — skip duplicate
-
                     await _send_one(bot, chat_id, msg)
-                    sent_this_cycle.add(cache_key)
                     await _inc_stat(db, "total_sent")
-                    print(f"  ✅ Sent")
-
+                    print(f"  ✅ Sent message {idx + 1}/{len(messages)}")
                     if idx < len(messages) - 1:
                         await asyncio.sleep(random.uniform(2, 3))
 
             except FloodWait as e:
-                print(f"  ⚠️  FloodWait {e.value}s on {name} — skipping")
+                # Wait exactly as long as Telegram demands, then keep going
+                print(f"  ⚠️  FloodWait {e.value}s on {name} — waiting, then continuing")
                 await _inc_stat(db, "total_failed")
+                group_ok = False
                 await asyncio.sleep(e.value)
-            except (SlowModeWait, ChatWriteForbidden,
-                    UserBannedInChannel, PeerIdInvalid) as e:
-                print(f"  ⚠️  {type(e).__name__} — skipping {name}")
+            except SlowmodeWait as e:
+                wait_time = getattr(e, "value", 30)
+                print(f"  ⚠️  SlowmodeWait {wait_time}s on {name} — skipping")
                 await _inc_stat(db, "total_failed")
+                group_ok = False
+            except (ChatWriteForbidden, UserBannedInChannel, PeerIdInvalid) as e:
+                print(f"  ⚠️  {type(e).__name__} on {name} — skipping")
+                await _inc_stat(db, "total_failed")
+                group_ok = False
             except Exception as e:
-                print(f"  ⚠️  Error on {name}: {e} — skipping")
+                print(f"  ⚠️  Network/unknown error on {name}: {e} — skipping")
                 await _inc_stat(db, "total_failed")
+                group_ok = False
 
-            if _running:
-                await asyncio.sleep(random.uniform(8, 12))
+            if group_ok:
+                successful += 1
+            else:
+                failed += 1
 
-        # ── End of cycle ─────────────────────────────────────────────────────
-        sent_this_cycle.clear()
+            # Delay between groups: strictly 5–10s; skip after the last group
+            if _running and i < total_groups - 1:
+                await asyncio.sleep(random.uniform(5, 10))
+
+        # ── End-of-cycle summary ─────────────────────────────────────────────
         await _set_stat(db, "last_promotion_time",
                         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
-        if _running:
-            print("⏳ Cycle complete — waiting 5 minutes.")
-            await asyncio.sleep(300)
+        print(
+            f"\n📊 Cycle Summary:\n"
+            f"   Total Groups : {total_groups}\n"
+            f"   Successful   : {successful}\n"
+            f"   Failed       : {failed}\n"
+        )
+
+        # ── Exact 5-minute cadence: subtract time already spent ──────────────
+        elapsed = asyncio.get_event_loop().time() - cycle_start
+        remaining = max(0.0, 300.0 - elapsed)
+        if _running and remaining > 0:
+            print(f"⏳ Next cycle in {remaining:.0f}s.")
+            await asyncio.sleep(remaining)
 
     print("🔴 Promotion Stopped")
 
