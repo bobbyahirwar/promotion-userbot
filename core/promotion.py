@@ -1,6 +1,7 @@
 import asyncio
 import io
 import random
+from datetime import datetime, timezone
 
 from pyrogram.errors import (
     FloodWait,
@@ -40,6 +41,24 @@ async def _send_one(bot, chat_id: int, msg: dict):
         await userbot.send_video(chat_id, buf, caption=caption)
 
 
+async def _inc_stat(db, key: str, amount: int = 1):
+    """Atomically increment a stats counter."""
+    await db.stats.update_one(
+        {"key": key},
+        {"$inc": {"value": amount}},
+        upsert=True,
+    )
+
+
+async def _set_stat(db, key: str, value):
+    """Set a stats value."""
+    await db.stats.update_one(
+        {"key": key},
+        {"$set": {"value": value}},
+        upsert=True,
+    )
+
+
 # ── Promotion loop ────────────────────────────────────────────────────────────
 
 async def _loop(bot):
@@ -62,9 +81,17 @@ async def _loop(bot):
             await asyncio.sleep(300)
             continue
 
+        # ── Blacklist filter ─────────────────────────────────────────────────
+        from handlers.blacklist import get_blacklisted_ids
+        blacklisted = await get_blacklisted_ids()
+        active_groups = [g for g in groups if g["chat_id"] not in blacklisted]
+
+        # ── Safe-sending cache (cleared each cycle) ──────────────────────────
+        sent_this_cycle: set[tuple[int, str]] = set()
+
         random.shuffle(messages)
 
-        for group in groups:
+        for group in active_groups:
             if not _running:
                 break
 
@@ -81,22 +108,37 @@ async def _loop(bot):
 
             try:
                 for idx, msg in enumerate(messages):
+                    cache_key = (chat_id, str(msg["_id"]))
+                    if cache_key in sent_this_cycle:
+                        continue  # already sent — skip duplicate
+
                     await _send_one(bot, chat_id, msg)
+                    sent_this_cycle.add(cache_key)
+                    await _inc_stat(db, "total_sent")
                     print(f"  ✅ Sent")
+
                     if idx < len(messages) - 1:
                         await asyncio.sleep(random.uniform(2, 3))
 
             except FloodWait as e:
                 print(f"  ⚠️  FloodWait {e.value}s on {name} — skipping")
+                await _inc_stat(db, "total_failed")
                 await asyncio.sleep(e.value)
             except (SlowModeWait, ChatWriteForbidden,
                     UserBannedInChannel, PeerIdInvalid) as e:
                 print(f"  ⚠️  {type(e).__name__} — skipping {name}")
+                await _inc_stat(db, "total_failed")
             except Exception as e:
                 print(f"  ⚠️  Error on {name}: {e} — skipping")
+                await _inc_stat(db, "total_failed")
 
             if _running:
                 await asyncio.sleep(random.uniform(8, 12))
+
+        # ── End of cycle ─────────────────────────────────────────────────────
+        sent_this_cycle.clear()
+        await _set_stat(db, "last_promotion_time",
+                        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
         if _running:
             print("⏳ Cycle complete — waiting 5 minutes.")
