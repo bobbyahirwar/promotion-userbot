@@ -10,10 +10,12 @@ async def main():
     from core.bot import bot_app
     from core.userbot import userbot
     from database import init_db
-    from handlers import admin
+    from handlers import admin, messages, groups
 
-    # Register admin handlers
+    # Register handlers
     admin.register(bot_app)
+    messages.register(bot_app)
+    groups.register(bot_app)
 
     # Start Telegram Bot
     try:
