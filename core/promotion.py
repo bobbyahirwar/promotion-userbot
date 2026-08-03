@@ -165,6 +165,20 @@ async def _loop(bot):
                 await mark_inactive(chat_id, reason)
                 group_result = "inactive"
 
+            except ValueError as e:
+                # pyrogram/utils.py:get_peer_type() raises a plain ValueError
+                # (not a Pyrogram RPC class) for IDs outside all known ranges.
+                # "Peer id invalid: <id>" is a permanent condition — deactivate.
+                err_str = str(e).lower()
+                if "peer id invalid" in err_str or "peer_id_invalid" in err_str:
+                    await _inc_stat(db, "total_failed")
+                    await mark_inactive(chat_id, f"PeerIdInvalid(ValueError): {e}")
+                    group_result = "inactive"
+                else:
+                    print(f"  ⚠️  ValueError on {name}: {e} — continuing")
+                    await _inc_stat(db, "total_failed")
+                    group_result = "failed"
+
             except Exception as e:
                 # Temporary (network, timeout, unknown) — do NOT deactivate.
                 print(f"  ⚠️  Temporary error on {name}: {e} — continuing")
