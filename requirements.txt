@@ -3,4 +3,4 @@ TgCrypto==1.2.5
 motor
 python-dotenv==1.0.1
 python-telegram-bot
-motor
+flask

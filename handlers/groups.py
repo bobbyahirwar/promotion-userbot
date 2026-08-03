@@ -1,6 +1,13 @@
 from telegram import Update
 from telegram.ext import ContextTypes, CommandHandler
 from pyrogram.enums import ChatType
+from pyrogram.errors import (
+    PeerIdInvalid,
+    ChannelPrivate,
+    UserNotParticipant,
+    UsernameNotOccupied,
+    UsernameInvalid,
+)
 from database import get_db
 from handlers.admin import owner_only
 from core.userbot import userbot
@@ -31,6 +38,52 @@ async def scan_and_store() -> tuple[int, int]:
         await db.groups.insert_many([{"chat_id": gid} for gid in to_store])
 
     return total_found, len(to_store)
+
+
+# ── Startup validator ─────────────────────────────────────────────────────────
+
+# Errors that mean the group is permanently inaccessible — remove it from DB.
+_INVALID_PEER_ERRORS = (
+    PeerIdInvalid,
+    ChannelPrivate,
+    UserNotParticipant,
+    UsernameNotOccupied,
+    UsernameInvalid,
+)
+
+async def validate_and_clean_groups() -> tuple[int, int]:
+    """
+    Called once at startup (after userbot connects and DB is ready).
+    Checks every stored group with get_chat(); removes any that are
+    permanently inaccessible.  Never raises — always returns normally.
+
+    Returns (kept, removed).
+    """
+    db = get_db()
+    groups = await db.groups.find({}, {"chat_id": 1}).to_list(None)
+
+    kept = 0
+    removed = 0
+
+    for doc in groups:
+        chat_id = doc["chat_id"]
+        try:
+            await userbot.get_chat(chat_id)
+            kept += 1
+        except _INVALID_PEER_ERRORS as e:
+            await db.groups.delete_one({"chat_id": chat_id})
+            print(f"   🗑️  Removed invalid group {chat_id}: {type(e).__name__}")
+            removed += 1
+        except ValueError:
+            # Some IDs surface as plain ValueError before reaching Pyrogram
+            await db.groups.delete_one({"chat_id": chat_id})
+            print(f"   🗑️  Removed invalid group {chat_id}: ValueError")
+            removed += 1
+        except Exception:
+            # Temporary error (FloodWait, network, etc.) — keep the group
+            kept += 1
+
+    return kept, removed
 
 
 # ── Command ───────────────────────────────────────────────────────────────────
