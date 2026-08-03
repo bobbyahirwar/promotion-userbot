@@ -25,6 +25,7 @@ _PERMANENT_ERRORS = (
     UserNotParticipant,
 )
 
+from config import PROMOTION_INTERVAL_SECONDS
 from database import get_db
 from core.userbot import userbot
 
@@ -86,14 +87,14 @@ async def _loop(bot):
 
         messages = await db.messages.find().to_list(100)
         if not messages:
-            print("⚠️  No messages saved — waiting 5 minutes.")
-            await asyncio.sleep(300)
+            print(f"⚠️  No messages saved — waiting {PROMOTION_INTERVAL_SECONDS}s.")
+            await asyncio.sleep(PROMOTION_INTERVAL_SECONDS)
             continue
 
         groups = await db.groups.find().to_list(100)
         if not groups:
-            print("⚠️  No groups stored — waiting 5 minutes.")
-            await asyncio.sleep(300)
+            print(f"⚠️  No groups stored — waiting {PROMOTION_INTERVAL_SECONDS}s.")
+            await asyncio.sleep(PROMOTION_INTERVAL_SECONDS)
             continue
 
         # ── Rotating message selection ────────────────────────────────────────
@@ -201,9 +202,9 @@ async def _loop(bot):
 
             print(f"[{i + 1}/{total_groups}] {name} -> {label}")
 
-            # 3–5 s between groups; no delay after the very last group
+            # 5–10 s between groups; no delay after the very last group
             if _running and i < total_groups - 1:
-                await asyncio.sleep(random.uniform(3, 5))
+                await asyncio.sleep(random.uniform(5, 10))
 
         # ── End-of-cycle summary ─────────────────────────────────────────────
         await _set_stat(db, "last_promotion_time",

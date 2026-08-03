@@ -27,6 +27,10 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 MONGO_URI = os.getenv("MONGO_URI")
 
+# Seconds between promotion cycles. Override via PROMOTION_INTERVAL_SECONDS
+# environment variable; defaults to 60.
+PROMOTION_INTERVAL_SECONDS = int(os.getenv("PROMOTION_INTERVAL_SECONDS", 60))
+
 # ── Validate SESSION_STRING format ────────────────────────────────────────────
 # Pyrogram 2.0.106 accepts 271 bytes (new), 267 bytes (old 64-bit),
 # or 263 bytes (old 32-bit) after base64url-decoding.
