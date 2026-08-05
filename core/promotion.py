@@ -105,6 +105,15 @@ async def _log_event(db, event: dict):
         print(f"⚠️  Log event failed: {e}")
 
 
+async def _is_debug_mode(db) -> bool:
+    """Return True if debug mode is currently enabled in MongoDB."""
+    try:
+        doc = await db.state.find_one({"key": "debug_mode"})
+        return bool(doc and doc.get("value"))
+    except Exception:
+        return False
+
+
 # ── Promotion loop ────────────────────────────────────────────────────────────
 
 async def _loop(bot):
@@ -127,6 +136,9 @@ async def _loop(bot):
             print(f"⚠️  No groups stored — waiting {PROMOTION_INTERVAL_SECONDS}s.")
             await asyncio.sleep(PROMOTION_INTERVAL_SECONDS)
             continue
+
+        # ── Check debug mode once per cycle ──────────────────────────────────
+        debug = await _is_debug_mode(db)
 
         # ── Rotating message selection ────────────────────────────────────────
         # Load persisted index, pick one message for this entire cycle, then
@@ -152,16 +164,18 @@ async def _loop(bot):
         failed     = 0
         deactivated = 0
 
-        # ── Cycle-start notification ─────────────────────────────────────────
+        # ── Cycle-start notification (debug only) ─────────────────────────────
         now_str = datetime.now(timezone.utc).strftime("%I:%M %p")
-        cycle_start_text = (
-            "🚀 Promotion Cycle Started\n\n"
-            f"🕒 Time: {now_str} UTC\n"
-            f"📨 Message: #{cycle_msg_idx + 1}/{len(messages)}\n"
-            f"👥 Total Groups: {total_groups}\n\n"
-            "━━━━━━━━━━━━━━"
-        )
-        await _notify(bot, cycle_start_text)
+        if debug:
+            cycle_start_text = (
+                "🚀 Promotion Cycle Started\n\n"
+                f"🕒 Time: {now_str} UTC\n"
+                f"📨 Message: #{cycle_msg_idx + 1}/{len(messages)}\n"
+                f"👥 Total Groups: {total_groups}\n\n"
+                "━━━━━━━━━━━━━━"
+            )
+            await _notify(bot, cycle_start_text)
+
         await _log_event(db, {
             "type": "cycle_start",
             "message_num": cycle_msg_idx + 1,
@@ -174,6 +188,7 @@ async def _loop(bot):
                 break
 
             chat_id = group["chat_id"]
+            group_timer_start = asyncio.get_event_loop().time()
 
             # Resolve display name — never let this block or crash the loop
             try:
@@ -197,6 +212,9 @@ async def _loop(bot):
                 print(f"  ⚠️  FloodWait {e.value}s — waiting then resuming")
                 await _inc_stat(db, "total_failed")
                 group_result = "failed"
+                # Notify about the wait before sleeping so the owner sees it immediately
+                if debug:
+                    await _notify(bot, f"⏳ FloodWait: waiting {e.value}s before continuing...")
                 await asyncio.sleep(e.value)
 
             except SlowmodeWait as e:
@@ -239,42 +257,48 @@ async def _loop(bot):
                 group_result = "failed"
 
             # ── Per-group result ─────────────────────────────────────────────
+            time_taken = asyncio.get_event_loop().time() - group_timer_start
+
             if group_result == "ok":
                 status_emoji = "✅ Sent"
                 label        = "Sent (1 msg)"
                 successful  += 1
             elif group_result == "skipped":
-                status_emoji = f"⏭ Skipped"
+                status_emoji = "⏭ Skipped"
                 label        = "Skipped (temporary)"
                 skipped     += 1
             elif group_result == "inactive":
-                status_emoji = f"🚫 Deactivated"
+                status_emoji = "🚫 Deactivated"
                 label        = "Deactivated (permanent error)"
                 deactivated += 1
             else:
-                status_emoji = f"❌ Failed"
+                status_emoji = "❌ Failed"
                 label        = "Failed (temporary)"
                 failed      += 1
 
+            remaining_groups = total_groups - (i + 1)
             print(f"[{i + 1}/{total_groups}] {name} -> {label}")
 
-            # Build per-group Telegram notification
-            if error_detail:
-                group_text = (
-                    f"[{i + 1}/{total_groups}]\n"
-                    f"Group: {name}\n"
-                    f"Status: {status_emoji}\n"
-                    f"Reason:\n{error_detail}"
+            # ── Per-group debug notification ──────────────────────────────────
+            if debug:
+                lines = [
+                    f"[{i + 1}/{total_groups}]",
+                    f"Group: {name}",
+                    f"ID: {chat_id}",
+                    f"Result: {status_emoji}",
+                ]
+                if error_detail:
+                    lines.append(f"Error: {error_detail}")
+                lines.append(f"Time: {time_taken:.2f}s")
+                lines.append("")
+                lines.append(
+                    f"✅ {successful} | ❌ {failed} | "
+                    f"⏭ {skipped} | 🚫 {deactivated} | "
+                    f"⏳ {remaining_groups} remaining"
                 )
-            else:
-                group_text = (
-                    f"[{i + 1}/{total_groups}]\n"
-                    f"Group: {name}\n"
-                    f"Status: {status_emoji}"
-                )
-            await _notify(bot, group_text)
+                await _notify(bot, "\n".join(lines))
 
-            # Save to logs
+            # Save to logs (always, regardless of debug mode)
             await _log_event(db, {
                 "type": "group_result",
                 "index": i + 1,
@@ -283,6 +307,7 @@ async def _loop(bot):
                 "chat_id": chat_id,
                 "result": group_result,
                 "error": error_detail,
+                "time_taken": round(time_taken, 2),
             })
 
             # 5–10 s between groups; no delay after the very last group
@@ -319,19 +344,20 @@ async def _loop(bot):
             f"   Next message : #{next_idx + 1}\n"
         )
 
-        # ── End-of-cycle Telegram report ──────────────────────────────────────
-        report_text = (
-            "📊 Promotion Report\n\n"
-            f"Total Groups: {total_groups}\n"
-            f"Successful: {successful}\n"
-            f"Failed: {failed}\n"
-            f"Skipped: {skipped}\n"
-            f"Deactivated: {deactivated}\n\n"
-            f"Next Cycle: {next_cycle_str}"
-        )
-        await _notify(bot, report_text)
+        # ── End-of-cycle Telegram report (debug only) ─────────────────────────
+        if debug:
+            report_text = (
+                "📊 Promotion Report\n\n"
+                f"Total Groups: {total_groups}\n"
+                f"Successful: {successful}\n"
+                f"Failed: {failed}\n"
+                f"Skipped: {skipped}\n"
+                f"Deactivated: {deactivated}\n\n"
+                f"Next Cycle: {next_cycle_str}"
+            )
+            await _notify(bot, report_text)
 
-        # ── Save cycle report to MongoDB ──────────────────────────────────────
+        # ── Save cycle report to MongoDB (always) ─────────────────────────────
         report_doc = {
             "timestamp": datetime.now(timezone.utc),
             "message_num": cycle_msg_idx + 1,

@@ -26,6 +26,40 @@ async def cmd_stoppromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def cmd_debugpromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle debug mode on/off. State persists in MongoDB across restarts."""
+    db = get_db()
+    doc = await db.state.find_one({"key": "debug_mode"})
+    current = bool(doc and doc.get("value"))
+    new_val = not current
+
+    await db.state.update_one(
+        {"key": "debug_mode"},
+        {"$set": {"value": new_val}},
+        upsert=True,
+    )
+
+    if new_val:
+        text = (
+            "🟢 Debug Mode Enabled ✅\n\n"
+            "You will now receive live promotion updates:\n"
+            "• Cycle start notification\n"
+            "• Per-group result with ID, status, error, time taken & running counters\n"
+            "• FloodWait / SlowmodeWait alerts\n"
+            "• Full end-of-cycle summary report"
+        )
+    else:
+        text = (
+            "🔴 Debug Mode Disabled ❌\n\n"
+            "Promotion will run silently.\n"
+            "Reports and logs are still saved to MongoDB.\n"
+            "Use /lastreport or /logs to check results."
+        )
+
+    await update.message.reply_text(text)
+
+
+@owner_only
 async def cmd_lastreport(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show the most recent promotion cycle report."""
     db = get_db()
@@ -130,5 +164,6 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def register(app):
     app.add_handler(CommandHandler("startpromo",  cmd_startpromo))
     app.add_handler(CommandHandler("stoppromo",   cmd_stoppromo))
+    app.add_handler(CommandHandler("debugpromo",  cmd_debugpromo))
     app.add_handler(CommandHandler("lastreport",  cmd_lastreport))
     app.add_handler(CommandHandler("logs",        cmd_logs))

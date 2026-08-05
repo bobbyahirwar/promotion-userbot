@@ -43,6 +43,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📣 Promotion\n"
         "/startpromo — Start automatic promotion\n"
         "/stoppromo — Stop automatic promotion\n"
+        "/debugpromo — Toggle live debug updates (on/off)\n"
         "/lastreport — Show the last promotion cycle report\n"
         "/logs — Show last 30 promotion events\n\n"
         "🚫 Inactive Groups\n"
