@@ -34,9 +34,11 @@ threading.Thread(target=_run_flask, daemon=True).start()
 async def main():
     from core.bot import bot_app
     from core.userbot import userbot
-    from database import init_db
+    from database import init_db, get_db
     from handlers import admin, messages, groups, promo, blacklist, stats, inactive_groups
+    import handlers.sync_groups as sync_groups_mod
     from handlers.groups import validate_and_clean_groups
+    from handlers.sync_groups import sync_joined_groups
     from core.promotion import restore_state
 
     # Register handlers
@@ -47,6 +49,7 @@ async def main():
     blacklist.register(bot_app)
     stats.register(bot_app)
     inactive_groups.register(bot_app)
+    sync_groups_mod.register(bot_app)
 
     # Start Telegram Bot
     try:
@@ -71,6 +74,49 @@ async def main():
 
     # Connect MongoDB
     await init_db()
+
+    # ── Account-change detection ──────────────────────────────────────────────
+    # If the SESSION_STRING belongs to a different Telegram account than the
+    # one stored in MongoDB, all previous group data is stale — clear it and
+    # start fresh before syncing.
+    db = get_db()
+    me = await userbot.get_me()
+    current_user_id = me.id
+
+    stored_doc = await db.state.find_one({"key": "account_user_id"})
+    stored_user_id = stored_doc["value"] if stored_doc else None
+
+    if stored_user_id is not None and stored_user_id != current_user_id:
+        print(
+            f"⚠️  Userbot account changed "
+            f"({stored_user_id} → {current_user_id}). "
+            f"Clearing stale data…"
+        )
+        await db.groups.delete_many({})
+        await db.inactive_groups.delete_many({})
+        await db.stats.delete_many(
+            {"key": {"$in": ["total_sent", "total_failed", "last_promotion_time"]}}
+        )
+        print("✅ Stale groups, inactive list, and stats cleared.")
+
+    # Persist the current account ID so future startups can detect a change.
+    await db.state.update_one(
+        {"key": "account_user_id"},
+        {"$set": {"value": current_user_id}},
+        upsert=True,
+    )
+
+    # ── Sync joined groups from Telegram ─────────────────────────────────────
+    # Upserts every group/supergroup the userbot is a member of.  New groups
+    # are added; existing ones have their title/username refreshed.  This
+    # runs on every startup so the DB stays in sync with reality.
+    print("🔄 Syncing joined groups from Telegram…")
+    sync_total, sync_added, sync_updated, sync_skipped = await sync_joined_groups()
+    print(
+        f"✅ Group sync done — "
+        f"{sync_added} added, {sync_updated} updated, "
+        f"{sync_skipped} skipped ({sync_total} dialogs total)"
+    )
 
     # Validate stored groups — remove any that are permanently inaccessible.
     # This runs once per startup and never crashes the bot, even if every
