@@ -25,7 +25,7 @@ _PERMANENT_ERRORS = (
     UserNotParticipant,
 )
 
-from config import PROMOTION_INTERVAL_SECONDS
+from config import PROMOTION_INTERVAL_SECONDS, OWNER_ID
 from database import get_db
 from core.userbot import userbot
 
@@ -72,6 +72,37 @@ async def _set_stat(db, key: str, value):
         {"$set": {"value": value}},
         upsert=True,
     )
+
+
+async def _notify(bot, text: str):
+    """Send a Telegram message to the owner. Never raises — log failures only."""
+    try:
+        await bot.send_message(OWNER_ID, text)
+    except Exception as e:
+        print(f"⚠️  Owner notify failed: {e}")
+
+
+async def _log_event(db, event: dict):
+    """
+    Insert one event into promotion_logs and trim to the last 200 entries.
+    Never raises — errors are printed only.
+    """
+    try:
+        event.setdefault("timestamp", datetime.now(timezone.utc))
+        await db.promotion_logs.insert_one(event)
+        # Keep only the most recent 200 log entries
+        count = await db.promotion_logs.count_documents({})
+        if count > 200:
+            oldest_cursor = (
+                db.promotion_logs.find({}, {"_id": 1})
+                .sort("_id", 1)
+                .limit(count - 200)
+            )
+            oldest = await oldest_cursor.to_list(count - 200)
+            ids = [d["_id"] for d in oldest]
+            await db.promotion_logs.delete_many({"_id": {"$in": ids}})
+    except Exception as e:
+        print(f"⚠️  Log event failed: {e}")
 
 
 # ── Promotion loop ────────────────────────────────────────────────────────────
@@ -121,6 +152,23 @@ async def _loop(bot):
         failed     = 0
         deactivated = 0
 
+        # ── Cycle-start notification ─────────────────────────────────────────
+        now_str = datetime.now(timezone.utc).strftime("%I:%M %p")
+        cycle_start_text = (
+            "🚀 Promotion Cycle Started\n\n"
+            f"🕒 Time: {now_str} UTC\n"
+            f"📨 Message: #{cycle_msg_idx + 1}/{len(messages)}\n"
+            f"👥 Total Groups: {total_groups}\n\n"
+            "━━━━━━━━━━━━━━"
+        )
+        await _notify(bot, cycle_start_text)
+        await _log_event(db, {
+            "type": "cycle_start",
+            "message_num": cycle_msg_idx + 1,
+            "total_messages": len(messages),
+            "total_groups": total_groups,
+        })
+
         for i, group in enumerate(active_groups):
             if not _running:
                 break
@@ -134,18 +182,18 @@ async def _loop(bot):
             except Exception:
                 name = str(chat_id)
 
-            msgs_sent    = 0
-            # "ok" | "skipped" | "failed"
+            # "ok" | "skipped" | "failed" | "inactive"
             group_result = "ok"
+            error_detail = ""
 
             try:
                 await _send_one(bot, chat_id, current_msg)
                 await _inc_stat(db, "total_sent")
-                msgs_sent = 1
 
             except FloodWait as e:
                 # Temporary — wait exactly as long as Telegram requires, then
                 # move on.  Never deactivate the group for this.
+                error_detail = f"FloodWait {e.value} seconds"
                 print(f"  ⚠️  FloodWait {e.value}s — waiting then resuming")
                 await _inc_stat(db, "total_failed")
                 group_result = "failed"
@@ -154,6 +202,7 @@ async def _loop(bot):
             except SlowmodeWait as e:
                 # Temporary — skip this cycle, retry next time.
                 wait_time = getattr(e, "value", 30)
+                error_detail = f"Slowmode {wait_time} seconds"
                 print(f"  ⚠️  SlowmodeWait {wait_time}s — skipping group (temporary)")
                 await _inc_stat(db, "total_failed")
                 group_result = "skipped"
@@ -161,9 +210,9 @@ async def _loop(bot):
             except _PERMANENT_ERRORS as e:
                 # Permanent permission error — deactivate immediately so the
                 # group is excluded from every future cycle.
-                reason = type(e).__name__
+                error_detail = type(e).__name__
                 await _inc_stat(db, "total_failed")
-                await mark_inactive(chat_id, reason)
+                await mark_inactive(chat_id, error_detail)
                 group_result = "inactive"
 
             except ValueError as e:
@@ -172,35 +221,69 @@ async def _loop(bot):
                 # "Peer id invalid: <id>" is a permanent condition — deactivate.
                 err_str = str(e).lower()
                 if "peer id invalid" in err_str or "peer_id_invalid" in err_str:
+                    error_detail = f"PeerIdInvalid: {e}"
                     await _inc_stat(db, "total_failed")
                     await mark_inactive(chat_id, f"PeerIdInvalid(ValueError): {e}")
                     group_result = "inactive"
                 else:
+                    error_detail = f"ValueError: {e}"
                     print(f"  ⚠️  ValueError on {name}: {e} — continuing")
                     await _inc_stat(db, "total_failed")
                     group_result = "failed"
 
             except Exception as e:
                 # Temporary (network, timeout, unknown) — do NOT deactivate.
+                error_detail = f"{type(e).__name__}: {e}"
                 print(f"  ⚠️  Temporary error on {name}: {e} — continuing")
                 await _inc_stat(db, "total_failed")
                 group_result = "failed"
 
-            # ── Per-group result line ────────────────────────────────────────
+            # ── Per-group result ─────────────────────────────────────────────
             if group_result == "ok":
-                label = f"Sent (1 msg)"
-                successful += 1
+                status_emoji = "✅ Sent"
+                label        = "Sent (1 msg)"
+                successful  += 1
             elif group_result == "skipped":
-                label = "Skipped (temporary)"
-                skipped += 1
+                status_emoji = f"⏭ Skipped"
+                label        = "Skipped (temporary)"
+                skipped     += 1
             elif group_result == "inactive":
-                label = "Deactivated (permanent error)"
+                status_emoji = f"🚫 Deactivated"
+                label        = "Deactivated (permanent error)"
                 deactivated += 1
             else:
-                label = "Failed (temporary)"
-                failed += 1
+                status_emoji = f"❌ Failed"
+                label        = "Failed (temporary)"
+                failed      += 1
 
             print(f"[{i + 1}/{total_groups}] {name} -> {label}")
+
+            # Build per-group Telegram notification
+            if error_detail:
+                group_text = (
+                    f"[{i + 1}/{total_groups}]\n"
+                    f"Group: {name}\n"
+                    f"Status: {status_emoji}\n"
+                    f"Reason:\n{error_detail}"
+                )
+            else:
+                group_text = (
+                    f"[{i + 1}/{total_groups}]\n"
+                    f"Group: {name}\n"
+                    f"Status: {status_emoji}"
+                )
+            await _notify(bot, group_text)
+
+            # Save to logs
+            await _log_event(db, {
+                "type": "group_result",
+                "index": i + 1,
+                "total": total_groups,
+                "group_name": name,
+                "chat_id": chat_id,
+                "result": group_result,
+                "error": error_detail,
+            })
 
             # 5–10 s between groups; no delay after the very last group
             if _running and i < total_groups - 1:
@@ -215,6 +298,17 @@ async def _loop(bot):
         next_idx = (cycle_msg_idx + 1) % len(messages)
         await _set_stat(db, "current_message_index", next_idx)
 
+        # ── Exact 5-minute cadence: subtract time already spent ──────────────
+        elapsed   = asyncio.get_event_loop().time() - cycle_start
+        remaining = max(0.0, 300.0 - elapsed)
+
+        next_cycle_min = int(remaining // 60)
+        next_cycle_sec = int(remaining % 60)
+        if next_cycle_min > 0:
+            next_cycle_str = f"{next_cycle_min} Minutes {next_cycle_sec} Seconds"
+        else:
+            next_cycle_str = f"{next_cycle_sec} Seconds"
+
         print(
             f"\n📊 Cycle complete (message #{cycle_msg_idx + 1}/{len(messages)}):\n"
             f"   Total Groups : {total_groups}\n"
@@ -225,9 +319,45 @@ async def _loop(bot):
             f"   Next message : #{next_idx + 1}\n"
         )
 
-        # ── Exact 5-minute cadence: subtract time already spent ──────────────
-        elapsed   = asyncio.get_event_loop().time() - cycle_start
-        remaining = max(0.0, 300.0 - elapsed)
+        # ── End-of-cycle Telegram report ──────────────────────────────────────
+        report_text = (
+            "📊 Promotion Report\n\n"
+            f"Total Groups: {total_groups}\n"
+            f"Successful: {successful}\n"
+            f"Failed: {failed}\n"
+            f"Skipped: {skipped}\n"
+            f"Deactivated: {deactivated}\n\n"
+            f"Next Cycle: {next_cycle_str}"
+        )
+        await _notify(bot, report_text)
+
+        # ── Save cycle report to MongoDB ──────────────────────────────────────
+        report_doc = {
+            "timestamp": datetime.now(timezone.utc),
+            "message_num": cycle_msg_idx + 1,
+            "total_messages": len(messages),
+            "total_groups": total_groups,
+            "successful": successful,
+            "failed": failed,
+            "skipped": skipped,
+            "deactivated": deactivated,
+            "next_cycle_seconds": int(remaining),
+        }
+        try:
+            await db.promotion_reports.insert_one(report_doc)
+        except Exception as e:
+            print(f"⚠️  Failed to save cycle report: {e}")
+
+        await _log_event(db, {
+            "type": "cycle_end",
+            "message_num": cycle_msg_idx + 1,
+            "total_groups": total_groups,
+            "successful": successful,
+            "failed": failed,
+            "skipped": skipped,
+            "deactivated": deactivated,
+        })
+
         if _running and remaining > 0:
             print(f"⏳ Next cycle in {remaining:.0f}s.")
             await asyncio.sleep(remaining)
