@@ -37,9 +37,11 @@ async def main():
     from database import init_db, get_db
     from handlers import admin, messages, groups, promo, blacklist, stats, inactive_groups
     import handlers.sync_groups as sync_groups_mod
+    import handlers.health as health_mod
     from handlers.groups import validate_and_clean_groups
     from handlers.sync_groups import sync_joined_groups
     from core.promotion import restore_state
+    from core.uptime import set_start_time
 
     # Register handlers
     admin.register(bot_app)
@@ -50,6 +52,7 @@ async def main():
     stats.register(bot_app)
     inactive_groups.register(bot_app)
     sync_groups_mod.register(bot_app)
+    health_mod.register(bot_app)
 
     # Start Telegram Bot
     try:
@@ -125,6 +128,9 @@ async def main():
     print("🔍 Validating stored groups...")
     kept, removed = await validate_and_clean_groups()
     print(f"✅ Groups validated: {kept} kept, {removed} removed.")
+
+    # Record the moment all services are ready (used by /health uptime)
+    set_start_time()
 
     # Resume promotion if it was running before restart
     await restore_state(bot_app.bot)

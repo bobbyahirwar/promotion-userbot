@@ -4,3 +4,4 @@ motor
 python-dotenv==1.0.1
 python-telegram-bot
 flask
+psutil
