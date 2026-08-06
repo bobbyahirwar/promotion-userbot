@@ -49,7 +49,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚫 Inactive Groups\n"
         "/inactivegroups — Show all auto-deactivated groups with reason\n"
         "/reactivategroups — Reactivate all inactive groups\n"
-        "/reactivate <group_id> — Reactivate one group by ID"
+        "/reactivate <group_id> — Reactivate one group by ID\n"
+        "/resetinactive — Clear all inactive groups and restore them"
     )
     await update.message.reply_text(text)
 

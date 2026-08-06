@@ -111,10 +111,11 @@ async def main():
     # are added; existing ones have their title/username refreshed.  This
     # runs on every startup so the DB stays in sync with reality.
     print("🔄 Syncing joined groups from Telegram…")
-    sync_total, sync_added, sync_updated, sync_skipped = await sync_joined_groups()
+    sync_total, sync_added, sync_updated, sync_skipped, sync_reactivated = await sync_joined_groups()
     print(
         f"✅ Group sync done — "
         f"{sync_added} added, {sync_updated} updated, "
+        f"{sync_reactivated} reactivated, "
         f"{sync_skipped} skipped ({sync_total} dialogs total)"
     )
 

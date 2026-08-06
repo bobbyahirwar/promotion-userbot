@@ -98,9 +98,20 @@ async def cmd_reactivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"ℹ️ Group <code>{chat_id}</code> was not in the inactive list.", parse_mode="HTML")
 
 
+@owner_only
+async def cmd_resetinactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear the entire inactive_groups collection and report how many were restored."""
+    count = await _reactivate_all()
+    await update.message.reply_text(
+        f"✅ Inactive Groups Reset Successfully\n\n"
+        f"Restored Groups: {count}"
+    )
+
+
 # ── Registration ──────────────────────────────────────────────────────────────
 
 def register(app):
     app.add_handler(CommandHandler("inactivegroups",   cmd_inactivegroups))
     app.add_handler(CommandHandler("reactivategroups", cmd_reactivategroups))
     app.add_handler(CommandHandler("reactivate",       cmd_reactivate))
+    app.add_handler(CommandHandler("resetinactive",    cmd_resetinactive))
