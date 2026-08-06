@@ -15,9 +15,9 @@ from pyrogram.errors import (
 )
 
 # Permanent permission errors that should deactivate a group.
-# Temporary errors (FloodWait, SlowmodeWait, network) are NOT listed here.
+# Temporary errors (FloodWait, SlowmodeWait, ChatWriteForbidden, network)
+# are NOT listed here — they are retried on the next cycle.
 _PERMANENT_ERRORS = (
-    ChatWriteForbidden,
     UserBannedInChannel,
     PeerIdInvalid,
     ChatAdminRequired,
