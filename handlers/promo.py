@@ -46,14 +46,22 @@ async def cmd_debugpromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Cycle start notification\n"
             "• Per-group result with ID, status, error, time taken & running counters\n"
             "• FloodWait / SlowmodeWait alerts\n"
-            "• Full end-of-cycle summary report"
+            "• Full end-of-cycle summary report\n\n"
+            "🛡 Safety Status\n"
+            "Failure Rate Protection: ACTIVE\n"
+            "Threshold: 50%\n"
+            "Status: MONITORING"
         )
     else:
         text = (
             "🔴 Debug Mode Disabled ❌\n\n"
             "Promotion will run silently.\n"
             "Reports and logs are still saved to MongoDB.\n"
-            "Use /lastreport or /logs to check results."
+            "Use /lastreport or /logs to check results.\n\n"
+            "🛡 Safety Status\n"
+            "Failure Rate Protection: ACTIVE\n"
+            "Threshold: 50%\n"
+            "Status: MONITORING"
         )
 
     await update.message.reply_text(text)

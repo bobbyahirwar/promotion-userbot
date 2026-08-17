@@ -54,7 +54,62 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Promotion status ──────────────────────────────────────────────────────
     promo_state = "🟢 Running" if is_running() else "🔴 Stopped"
-    lines.append(f"🔄 Promotion: {promo_state}")
+    cooldown_reason = None
+    cooldown_remaining = 0.0
+    safety_paused = False
+    safety_failure_rate = None
+    safety_threshold = None
+
+    if mongo_ok:
+        try:
+            cooldown_until_doc = await db.state.find_one({"key": "promotion_cooldown_until"})
+            cooldown_reason_doc = await db.state.find_one({"key": "promotion_cooldown_reason"})
+            if cooldown_until_doc and cooldown_until_doc.get("value"):
+                until_value = cooldown_until_doc["value"]
+                if isinstance(until_value, str):
+                    until_dt = datetime.fromisoformat(until_value.replace("Z", "+00:00"))
+                else:
+                    until_dt = until_value
+                remaining = (until_dt - datetime.now(timezone.utc)).total_seconds()
+                if remaining > 0:
+                    cooldown_remaining = max(0.0, remaining)
+                    cooldown_reason = cooldown_reason_doc.get("value") if cooldown_reason_doc else "FloodWait"
+                    promo_state = "COOLDOWN"
+
+            safety_doc = await db.state.find_one({"key": "promotion_safety_paused"})
+            if safety_doc and safety_doc.get("value"):
+                safety_paused = True
+                promo_state = "PAUSED"
+
+            safety_last_rate_doc = await db.state.find_one({"key": "promotion_safety_last_cycle_failure_rate"})
+            if safety_last_rate_doc and safety_last_rate_doc.get("value") is not None:
+                safety_failure_rate = float(safety_last_rate_doc["value"])
+
+            safety_threshold_doc = await db.state.find_one({"key": "promotion_safety_threshold"})
+            if safety_threshold_doc and safety_threshold_doc.get("value") is not None:
+                safety_threshold = float(safety_threshold_doc["value"])
+        except Exception:
+            cooldown_reason = None
+            cooldown_remaining = 0.0
+
+    if promo_state == "COOLDOWN":
+        lines.append("🔄 Promotion: COOLDOWN")
+        lines.append(f"Reason: {cooldown_reason or 'FloodWait'}")
+        lines.append(
+            f"Cooldown Remaining: {max(0, int(cooldown_remaining // 60))} minutes"
+        )
+    elif promo_state == "PAUSED":
+        lines.append("🔄 Promotion: PAUSED")
+        lines.append("Reason: Cycle failure rate exceeded threshold")
+        lines.append(
+            "🛡 Safety Status\n"
+            "Failure Rate Protection: ACTIVE\n"
+            f"Threshold: {safety_threshold * 100:.0f}% if safety_threshold is not None else '50%'\n"
+            f"Last Cycle: {((safety_failure_rate * 100) if safety_failure_rate is not None else 0):.0f}%\n"
+            "Status: PAUSED"
+        )
+    else:
+        lines.append(f"🔄 Promotion: {promo_state}")
 
     lines.append("")  # blank separator
 

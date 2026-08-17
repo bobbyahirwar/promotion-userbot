@@ -1,7 +1,7 @@
 import asyncio
 import io
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from pyrogram.errors import (
     FloodWait,
@@ -18,6 +18,7 @@ from pyrogram.errors import (
 # Temporary errors (FloodWait, SlowmodeWait, ChatWriteForbidden, network)
 # are NOT listed here — they are retried on the next cycle.
 _PERMANENT_ERRORS = (
+    ChatWriteForbidden,
     UserBannedInChannel,
     PeerIdInvalid,
     ChatAdminRequired,
@@ -25,7 +26,16 @@ _PERMANENT_ERRORS = (
     UserNotParticipant,
 )
 
-from config import PROMOTION_INTERVAL_SECONDS, OWNER_ID
+from config import (
+    PROMOTION_INTERVAL_SECONDS,
+    PROMOTION_MIN_DELAY_SECONDS,
+    PROMOTION_MAX_DELAY_SECONDS,
+    PROMOTION_COOLDOWN_SECONDS,
+    PROMOTION_MAX_CONSECUTIVE_ERRORS,
+    PROMOTION_MAX_FAILURE_RATE,
+    PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE,
+    OWNER_ID,
+)
 from database import get_db
 from core.userbot import userbot
 
@@ -114,6 +124,220 @@ async def _is_debug_mode(db) -> bool:
         return False
 
 
+async def _get_consecutive_error_count(db) -> int:
+    """Return the persisted consecutive temporary-error counter."""
+    doc = await db.state.find_one({"key": "promotion_consecutive_errors"})
+    if not doc or doc.get("value") is None:
+        return 0
+    try:
+        return int(doc["value"])
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _set_consecutive_error_count(db, value: int):
+    """Persist the consecutive temporary-error count for future cycles."""
+    await db.state.update_one(
+        {"key": "promotion_consecutive_errors"},
+        {"$set": {"value": max(0, int(value))}},
+        upsert=True,
+    )
+
+
+async def _get_cooldown_state(db):
+    """Return the active cooldown document if the promotion is paused."""
+    doc = await db.state.find_one({"key": "promotion_cooldown_until"})
+    if not doc or not doc.get("value"):
+        return None
+    try:
+        if isinstance(doc["value"], datetime):
+            until = doc["value"]
+        else:
+            until = datetime.fromisoformat(str(doc["value"]).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    return {"until": until, "reason": await db.state.find_one({"key": "promotion_cooldown_reason"})}
+
+
+async def _has_active_cooldown(db) -> bool:
+    """True when the promo loop is globally paused by a FloodWait cooldown."""
+    cooldown = await _get_cooldown_state(db)
+    if not cooldown:
+        return False
+    now = datetime.now(timezone.utc)
+    return now < cooldown["until"]
+
+
+async def _get_cooldown_remaining_seconds(db) -> float:
+    """Return remaining cooldown seconds; 0 when no active cooldown exists."""
+    cooldown = await _get_cooldown_state(db)
+    if not cooldown:
+        return 0.0
+    remaining = (cooldown["until"] - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, remaining)
+
+
+async def _clear_cooldown(db):
+    """Clear FloodWait cooldown state from MongoDB when the pause has ended."""
+    await db.state.delete_many({
+        "key": {
+            "$in": [
+                "promotion_cooldown_until",
+                "promotion_cooldown_reason",
+                "promotion_cooldown_started_at",
+            ]
+        }
+    })
+
+
+async def _is_safety_pause_active(db) -> bool:
+    """True when a cycle-level safety pause is active in MongoDB."""
+    doc = await db.state.find_one({"key": "promotion_safety_paused"})
+    return bool(doc and doc.get("value"))
+
+
+async def _trigger_safety_pause(db, cycle_summary: dict, bot=None):
+    """Persist a cycle-level automatic safety pause when failures are too high."""
+    now = datetime.now(timezone.utc)
+    await db.state.update_one(
+        {"key": "promotion_safety_paused"},
+        {"$set": {"value": True, "updated_at": now}},
+        upsert=True,
+    )
+    await db.state.update_one(
+        {"key": "promotion_safety_pause_reason"},
+        {"$set": {"value": "Cycle failure rate exceeded threshold", "updated_at": now}},
+        upsert=True,
+    )
+    await db.state.update_one(
+        {"key": "promotion_safety_pause_snapshot"},
+        {"$set": {"value": cycle_summary, "updated_at": now}},
+        upsert=True,
+    )
+    await db.state.update_one(
+        {"key": "promotion_safety_pause_started_at"},
+        {"$set": {"value": now, "updated_at": now}},
+        upsert=True,
+    )
+
+    await _log_event(db, {
+        "type": "safety_pause",
+        "reason": "Cycle failure rate exceeded threshold",
+        "total_groups": cycle_summary.get("total_groups"),
+        "successful": cycle_summary.get("successful"),
+        "failed": cycle_summary.get("failed"),
+        "skipped": cycle_summary.get("skipped"),
+        "deactivated": cycle_summary.get("deactivated"),
+        "failure_rate": cycle_summary.get("failure_rate"),
+        "timestamp": now,
+    })
+
+    if bot and await _is_debug_mode(db):
+        await _notify(
+            bot,
+            "🛑 Promotion Safety Pause\n\n"
+            "Cycle completed with unusually high failures.\n\n"
+            f"👥 Groups: {cycle_summary.get('total_groups', 0)}\n"
+            f"✅ Successful: {cycle_summary.get('successful', 0)}\n"
+            f"❌ Failed: {cycle_summary.get('failed', 0)}\n"
+            f"⏭ Skipped: {cycle_summary.get('skipped', 0)}\n"
+            f"🚫 Deactivated: {cycle_summary.get('deactivated', 0)}\n\n"
+            f"📉 Failure Rate: {cycle_summary.get('failure_rate_display', '0%')}\n\n"
+            "Promotion has been automatically paused for safety.",
+        )
+
+    print(
+        f"🛑 Promotion safety pause activated: failure_rate={cycle_summary.get('failure_rate_display', '0%')} "
+        f"groups={cycle_summary.get('total_groups', 0)}"
+    )
+
+
+async def _clear_safety_pause(db):
+    """Clear cycle safety pause state from MongoDB when the operator resets it."""
+    await db.state.delete_many({
+        "key": {
+            "$in": [
+                "promotion_safety_paused",
+                "promotion_safety_pause_reason",
+                "promotion_safety_pause_snapshot",
+                "promotion_safety_pause_started_at",
+            ]
+        }
+    })
+
+
+async def _trigger_cooldown(
+    db,
+    reason: str,
+    bot=None,
+    flood_wait_seconds: int | None = None,
+    consecutive_errors: int | None = None,
+):
+    """Persist the existing global cooldown and stop the current promotion cycle."""
+    now = datetime.now(timezone.utc)
+    cooldown_until = now + timedelta(seconds=PROMOTION_COOLDOWN_SECONDS)
+    await db.state.update_one(
+        {"key": "promotion_cooldown_until"},
+        {"$set": {"value": cooldown_until, "updated_at": now}},
+        upsert=True,
+    )
+    await db.state.update_one(
+        {"key": "promotion_cooldown_reason"},
+        {"$set": {"value": reason, "updated_at": now}},
+        upsert=True,
+    )
+    await db.state.update_one(
+        {"key": "promotion_cooldown_started_at"},
+        {"$set": {"value": now, "updated_at": now}},
+        upsert=True,
+    )
+
+    payload = {
+        "type": "promotion_cooldown",
+        "reason": reason,
+        "cooldown_seconds": PROMOTION_COOLDOWN_SECONDS,
+        "cooldown_until": cooldown_until,
+        "started_at": now,
+    }
+    if flood_wait_seconds is not None:
+        payload["flood_wait_seconds"] = int(flood_wait_seconds)
+    if consecutive_errors is not None:
+        payload["consecutive_errors"] = int(consecutive_errors)
+    await _log_event(db, payload)
+
+    if bot and await _is_debug_mode(db):
+        if reason == "FloodWait":
+            await _notify(
+                bot,
+                "🚨 PROMOTION COOLDOWN\n\n"
+                "Reason: Telegram FloodWait\n"
+                f"Telegram Wait: {int(flood_wait_seconds or 0)} seconds\n"
+                f"Safety Cooldown: {PROMOTION_COOLDOWN_SECONDS} seconds\n\n"
+                "Promotion has been paused.",
+            )
+        else:
+            await _notify(
+                bot,
+                "🚨 PROMOTION AUTO-PAUSED\n\n"
+                f"Reason: {reason}\n"
+                f"Consecutive Errors: {int(consecutive_errors or 0)}\n"
+                f"Cooldown: {PROMOTION_COOLDOWN_SECONDS} seconds\n\n"
+                "Promotion has been paused.",
+            )
+
+    if reason == "FloodWait":
+        print(
+            f"🚨 FloodWait cooldown activated: {int(flood_wait_seconds or 0)}s wait, "
+            f"{PROMOTION_COOLDOWN_SECONDS}s pause until {cooldown_until.isoformat()}"
+        )
+    else:
+        print(
+            f"🚨 Promotion auto-paused: {reason}, "
+            f"consecutive errors={int(consecutive_errors or 0)}, "
+            f"cooldown until {cooldown_until.isoformat()}"
+        )
+
+
 # ── Promotion loop ────────────────────────────────────────────────────────────
 
 async def _loop(bot):
@@ -124,6 +348,14 @@ async def _loop(bot):
     while _running:
         cycle_start = asyncio.get_event_loop().time()
         db = get_db()
+
+        # FloodWait cooldown is global and must block any new promotion sends
+        # until the pause expires, even after a process restart.
+        if await _has_active_cooldown(db):
+            remaining = await _get_cooldown_remaining_seconds(db)
+            print(f"⏳ Promotion cooldown active — waiting {remaining:.0f}s before resuming")
+            await asyncio.sleep(min(remaining, 60.0))
+            continue
 
         messages = await db.messages.find().to_list(100)
         if not messages:
@@ -139,6 +371,7 @@ async def _loop(bot):
 
         # ── Check debug mode once per cycle ──────────────────────────────────
         debug = await _is_debug_mode(db)
+        consecutive_error_count = await _get_consecutive_error_count(db)
 
         # ── Rotating message selection ────────────────────────────────────────
         # Load persisted index, pick one message for this entire cycle, then
@@ -163,6 +396,7 @@ async def _loop(bot):
         skipped    = 0
         failed     = 0
         deactivated = 0
+        cooldown_triggered = False
 
         # ── Cycle-start notification (debug only) ─────────────────────────────
         now_str = datetime.now(timezone.utc).strftime("%I:%M %p")
@@ -206,24 +440,41 @@ async def _loop(bot):
                 await _inc_stat(db, "total_sent")
 
             except FloodWait as e:
-                # Temporary — wait exactly as long as Telegram requires, then
-                # move on.  Never deactivate the group for this.
-                error_detail = f"FloodWait {e.value} seconds"
-                print(f"  ⚠️  FloodWait {e.value}s — waiting then resuming")
+                # FloodWait is not ignored: Telegram imposes the wait and the bot
+                # must stop the current cycle and enter a global cooldown.
+                wait_seconds = int(getattr(e, "value", 0) or 0)
+                error_detail = f"FloodWait {wait_seconds} seconds"
+                print(f"  ⚠️  FloodWait {wait_seconds}s — pausing promotion for cooldown")
                 await _inc_stat(db, "total_failed")
                 group_result = "failed"
-                # Notify about the wait before sleeping so the owner sees it immediately
-                if debug:
-                    await _notify(bot, f"⏳ FloodWait: waiting {e.value}s before continuing...")
-                await asyncio.sleep(e.value)
+                await _trigger_cooldown(
+                    db,
+                    reason="FloodWait",
+                    bot=bot,
+                    flood_wait_seconds=wait_seconds,
+                )
+                cooldown_triggered = True
+                break
 
             except SlowmodeWait as e:
-                # Temporary — skip this cycle, retry next time.
+                # Temporary — count it toward the consecutive-error safety check,
+                # but do not deactivate the group or retry it in the same cycle.
                 wait_time = getattr(e, "value", 30)
                 error_detail = f"Slowmode {wait_time} seconds"
-                print(f"  ⚠️  SlowmodeWait {wait_time}s — skipping group (temporary)")
+                print(f"  ⚠️  SlowmodeWait {wait_time}s — counting as temporary failure")
                 await _inc_stat(db, "total_failed")
-                group_result = "skipped"
+                group_result = "failed"
+                consecutive_error_count += 1
+                await _set_consecutive_error_count(db, consecutive_error_count)
+                if consecutive_error_count >= PROMOTION_MAX_CONSECUTIVE_ERRORS:
+                    await _trigger_cooldown(
+                        db,
+                        reason="Repeated temporary promotion errors",
+                        bot=bot,
+                        consecutive_errors=consecutive_error_count,
+                    )
+                    cooldown_triggered = True
+                    break
 
             except _PERMANENT_ERRORS as e:
                 # Permanent permission error — deactivate immediately so the
@@ -245,16 +496,38 @@ async def _loop(bot):
                     group_result = "inactive"
                 else:
                     error_detail = f"ValueError: {e}"
-                    print(f"  ⚠️  ValueError on {name}: {e} — continuing")
+                    print(f"  ⚠️  ValueError on {name}: {e} — counting as temporary failure")
                     await _inc_stat(db, "total_failed")
                     group_result = "failed"
+                    consecutive_error_count += 1
+                    await _set_consecutive_error_count(db, consecutive_error_count)
+                    if consecutive_error_count >= PROMOTION_MAX_CONSECUTIVE_ERRORS:
+                        await _trigger_cooldown(
+                            db,
+                            reason="Repeated temporary promotion errors",
+                            bot=bot,
+                            consecutive_errors=consecutive_error_count,
+                        )
+                        cooldown_triggered = True
+                        break
 
             except Exception as e:
                 # Temporary (network, timeout, unknown) — do NOT deactivate.
                 error_detail = f"{type(e).__name__}: {e}"
-                print(f"  ⚠️  Temporary error on {name}: {e} — continuing")
+                print(f"  ⚠️  Temporary error on {name}: {e} — counting as temporary failure")
                 await _inc_stat(db, "total_failed")
                 group_result = "failed"
+                consecutive_error_count += 1
+                await _set_consecutive_error_count(db, consecutive_error_count)
+                if consecutive_error_count >= PROMOTION_MAX_CONSECUTIVE_ERRORS:
+                    await _trigger_cooldown(
+                        db,
+                        reason="Repeated temporary promotion errors",
+                        bot=bot,
+                        consecutive_errors=consecutive_error_count,
+                    )
+                    cooldown_triggered = True
+                    break
 
             # ── Per-group result ─────────────────────────────────────────────
             time_taken = asyncio.get_event_loop().time() - group_timer_start
@@ -263,6 +536,8 @@ async def _loop(bot):
                 status_emoji = "✅ Sent"
                 label        = "Sent (1 msg)"
                 successful  += 1
+                await _set_consecutive_error_count(db, 0)
+                consecutive_error_count = 0
             elif group_result == "skipped":
                 status_emoji = "⏭ Skipped"
                 label        = "Skipped (temporary)"
@@ -310,13 +585,65 @@ async def _loop(bot):
                 "time_taken": round(time_taken, 2),
             })
 
-            # 5–10 s between groups; no delay after the very last group
+            # Conservative inter-group rate limit for promotions only.
+            # This delay is intentionally placed only between actual promotion
+            # sends, not between owner/debug notifications. It does not affect
+            # the 5-minute cycle cadence logic at the end of the cycle.
             if _running and i < total_groups - 1:
-                await asyncio.sleep(random.uniform(5, 10))
+                wait_seconds = random.uniform(
+                    PROMOTION_MIN_DELAY_SECONDS,
+                    PROMOTION_MAX_DELAY_SECONDS,
+                )
+                print(
+                    f"⏳ Inter-group rate limit: {wait_seconds:.1f}s before next promotion"
+                )
+                await asyncio.sleep(wait_seconds)
+
+        if cooldown_triggered:
+            print("⏳ FloodWait cooldown active — current cycle stopped before remaining groups")
+            continue
 
         # ── End-of-cycle summary ─────────────────────────────────────────────
         await _set_stat(db, "last_promotion_time",
                         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+
+        # Safety circuit-breaker: only evaluate the cycle failure rate against
+        # groups actually attempted in this cycle, not against already-excluded
+        # groups that were filtered out before the loop started.
+        failure_rate = (failed + skipped + deactivated) / total_groups if total_groups else 0.0
+        cycle_failure_threshold = PROMOTION_MAX_FAILURE_RATE
+        should_pause_for_failure_rate = (
+            total_groups >= PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE
+            and total_groups > 0
+            and failure_rate >= cycle_failure_threshold
+        )
+
+        if should_pause_for_failure_rate:
+            cycle_summary = {
+                "timestamp": datetime.now(timezone.utc),
+                "total_groups": total_groups,
+                "successful": successful,
+                "failed": failed,
+                "skipped": skipped,
+                "deactivated": deactivated,
+                "failure_rate": failure_rate,
+                "failure_rate_display": f"{failure_rate * 100:.0f}%",
+                "reason": "Cycle failure rate exceeded threshold",
+            }
+            await _trigger_safety_pause(db, cycle_summary, bot)
+            await _set_stat(db, "promotion_safety_last_cycle_failure_rate", failure_rate)
+            await _set_stat(db, "promotion_safety_last_cycle_total_groups", total_groups)
+            # The cycle is intentionally paused and must not continue sending. The
+            # loop will remain stopped until the operator intervenes or the system is
+            # reset; the existing cooldown logic is not used here to avoid altering
+            # the established safety layering.
+            _running = False
+            await db.state.update_one(
+                {"key": "promotion_running"},
+                {"$set": {"value": False}},
+                upsert=True,
+            )
+            break
 
         # Advance the rotating index and persist it for the next cycle /
         # restart.  Wraps via modulo when fetched at the top of the next cycle.
@@ -434,5 +761,9 @@ async def restore_state(bot):
     db = get_db()
     doc = await db.state.find_one({"key": "promotion_running"})
     if doc and doc.get("value"):
+        if await _has_active_cooldown(db) or await _is_safety_pause_active(db):
+            print("⏳ Active safety pause detected after restart — promotion remains paused")
+            await start_promotion(bot)
+            return
         print("🔄 Resuming promotion from previous session...")
         await start_promotion(bot)
