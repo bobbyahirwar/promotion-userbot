@@ -31,76 +31,16 @@ MONGO_URI = os.getenv("MONGO_URI")
 # environment variable; defaults to 60.
 PROMOTION_INTERVAL_SECONDS = int(os.getenv("PROMOTION_INTERVAL_SECONDS", 60))
 
-# Conservative delay between promotional sends to different groups.
-# If the values are missing, invalid, or inconsistent, fall back to the safe
-# default 15-30 second window so the bot remains stable and predictable.
-_DEFAULT_PROMOTION_MIN_DELAY_SECONDS = 15
-_DEFAULT_PROMOTION_MAX_DELAY_SECONDS = 30
-
-try:
-    _raw_min_delay = int(os.getenv("PROMOTION_MIN_DELAY_SECONDS", _DEFAULT_PROMOTION_MIN_DELAY_SECONDS))
-    _raw_max_delay = int(os.getenv("PROMOTION_MAX_DELAY_SECONDS", _DEFAULT_PROMOTION_MAX_DELAY_SECONDS))
-except (TypeError, ValueError):
-    _raw_min_delay = _DEFAULT_PROMOTION_MIN_DELAY_SECONDS
-    _raw_max_delay = _DEFAULT_PROMOTION_MAX_DELAY_SECONDS
-
-if _raw_min_delay < 1 or _raw_max_delay < _raw_min_delay:
-    PROMOTION_MIN_DELAY_SECONDS = _DEFAULT_PROMOTION_MIN_DELAY_SECONDS
-    PROMOTION_MAX_DELAY_SECONDS = _DEFAULT_PROMOTION_MAX_DELAY_SECONDS
-else:
-    PROMOTION_MIN_DELAY_SECONDS = _raw_min_delay
-    PROMOTION_MAX_DELAY_SECONDS = _raw_max_delay
-
-# Global cooldown after Telegram FloodWait. This is intentionally separate from
-# the per-group rate-limit added in Part 1 and is enforced as a safety stop.
-_DEFAULT_PROMOTION_COOLDOWN_SECONDS = 1800
-try:
-    PROMOTION_COOLDOWN_SECONDS = int(os.getenv("PROMOTION_COOLDOWN_SECONDS", _DEFAULT_PROMOTION_COOLDOWN_SECONDS))
-except (TypeError, ValueError):
-    PROMOTION_COOLDOWN_SECONDS = _DEFAULT_PROMOTION_COOLDOWN_SECONDS
-
-if PROMOTION_COOLDOWN_SECONDS < 1:
-    PROMOTION_COOLDOWN_SECONDS = _DEFAULT_PROMOTION_COOLDOWN_SECONDS
-
-# Consecutive temporary send failures that trigger a global promotion cooldown.
-_DEFAULT_PROMOTION_MAX_CONSECUTIVE_ERRORS = 5
-try:
-    PROMOTION_MAX_CONSECUTIVE_ERRORS = int(
-        os.getenv("PROMOTION_MAX_CONSECUTIVE_ERRORS", _DEFAULT_PROMOTION_MAX_CONSECUTIVE_ERRORS)
-    )
-except (TypeError, ValueError):
-    PROMOTION_MAX_CONSECUTIVE_ERRORS = _DEFAULT_PROMOTION_MAX_CONSECUTIVE_ERRORS
-
-if PROMOTION_MAX_CONSECUTIVE_ERRORS < 1:
-    PROMOTION_MAX_CONSECUTIVE_ERRORS = _DEFAULT_PROMOTION_MAX_CONSECUTIVE_ERRORS
-
-# End-of-cycle safety circuit breaker. If the failure rate is too high across a
-# sufficiently large sample, promotion is paused until the operator intervenes.
-_DEFAULT_PROMOTION_MAX_FAILURE_RATE = 0.50
-_DEFAULT_PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE = 10
-
-try:
-    PROMOTION_MAX_FAILURE_RATE = float(
-        os.getenv("PROMOTION_MAX_FAILURE_RATE", _DEFAULT_PROMOTION_MAX_FAILURE_RATE)
-    )
-except (TypeError, ValueError):
-    PROMOTION_MAX_FAILURE_RATE = _DEFAULT_PROMOTION_MAX_FAILURE_RATE
-
-if PROMOTION_MAX_FAILURE_RATE < 0:
-    PROMOTION_MAX_FAILURE_RATE = _DEFAULT_PROMOTION_MAX_FAILURE_RATE
-
-try:
-    PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE = int(
-        os.getenv(
-            "PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE",
-            _DEFAULT_PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE,
-        )
-    )
-except (TypeError, ValueError):
-    PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE = _DEFAULT_PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE
-
-if PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE < 1:
-    PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE = _DEFAULT_PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE
+# Promotion safety settings use built-in defaults so Render does not need any
+# new environment variables for these protections. Keep the existing required
+# app env vars unchanged.
+PROMOTION_MIN_DELAY_SECONDS = 15
+PROMOTION_MAX_DELAY_SECONDS = 30
+PROMOTION_COOLDOWN_SECONDS = 1800
+PROMOTION_MAX_CONSECUTIVE_ERRORS = 5
+PROMOTION_MAX_FAILURE_RATE = 0.50
+PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE = 10
+PROMOTION_MAX_RECOVERY_ATTEMPTS = 3
 
 # ── Validate SESSION_STRING format ────────────────────────────────────────────
 # Pyrogram 2.0.106 accepts 271 bytes (new), 267 bytes (old 64-bit),
