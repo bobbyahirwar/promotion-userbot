@@ -1,0 +1,6 @@
+{
+  "name": "Telegram Promotion Userbot",
+  "description": "Telegram Promotion Userbot and Status Monitor dashboard with multi-group rotation, FloodWait cooldown protection, and health diagnostics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

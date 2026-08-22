@@ -70,11 +70,16 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     until_dt = datetime.fromisoformat(until_value.replace("Z", "+00:00"))
                 else:
                     until_dt = until_value
-                remaining = (until_dt - datetime.now(timezone.utc)).total_seconds()
-                if remaining > 0:
-                    cooldown_remaining = max(0.0, remaining)
-                    cooldown_reason = cooldown_reason_doc.get("value") if cooldown_reason_doc else "FloodWait"
-                    promo_state = "COOLDOWN"
+                if isinstance(until_dt, datetime):
+                    if until_dt.tzinfo is None:
+                        until_dt = until_dt.replace(tzinfo=timezone.utc)
+                    else:
+                        until_dt = until_dt.astimezone(timezone.utc)
+                    remaining = (until_dt - datetime.now(timezone.utc)).total_seconds()
+                    if remaining > 0:
+                        cooldown_remaining = max(0.0, remaining)
+                        cooldown_reason = cooldown_reason_doc.get("value") if cooldown_reason_doc else "FloodWait"
+                        promo_state = "COOLDOWN"
 
             safety_doc = await db.state.find_one({"key": "promotion_safety_paused"})
             if safety_doc and safety_doc.get("value"):

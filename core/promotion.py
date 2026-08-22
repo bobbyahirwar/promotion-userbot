@@ -124,6 +124,30 @@ async def _is_debug_mode(db) -> bool:
         return False
 
 
+def _normalize_datetime(dt) -> datetime | None:
+    """Safely convert naive or aware datetime/ISO string into timezone-aware UTC datetime."""
+    if dt is None:
+        return None
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    if isinstance(dt, (int, float)):
+        try:
+            return datetime.fromtimestamp(dt, tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(dt, str):
+        try:
+            parsed = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
 async def _get_consecutive_error_count(db) -> int:
     """Return the persisted consecutive temporary-error counter."""
     doc = await db.state.find_one({"key": "promotion_consecutive_errors"})
@@ -149,12 +173,8 @@ async def _get_cooldown_state(db):
     doc = await db.state.find_one({"key": "promotion_cooldown_until"})
     if not doc or not doc.get("value"):
         return None
-    try:
-        if isinstance(doc["value"], datetime):
-            until = doc["value"]
-        else:
-            until = datetime.fromisoformat(str(doc["value"]).replace("Z", "+00:00"))
-    except Exception:
+    until = _normalize_datetime(doc.get("value"))
+    if not until:
         return None
     return {"until": until, "reason": await db.state.find_one({"key": "promotion_cooldown_reason"})}
 
@@ -162,7 +182,7 @@ async def _get_cooldown_state(db):
 async def _has_active_cooldown(db) -> bool:
     """True when the promo loop is globally paused by a FloodWait cooldown."""
     cooldown = await _get_cooldown_state(db)
-    if not cooldown:
+    if not cooldown or not cooldown.get("until"):
         return False
     now = datetime.now(timezone.utc)
     return now < cooldown["until"]
@@ -171,9 +191,10 @@ async def _has_active_cooldown(db) -> bool:
 async def _get_cooldown_remaining_seconds(db) -> float:
     """Return remaining cooldown seconds; 0 when no active cooldown exists."""
     cooldown = await _get_cooldown_state(db)
-    if not cooldown:
+    if not cooldown or not cooldown.get("until"):
         return 0.0
-    remaining = (cooldown["until"] - datetime.now(timezone.utc)).total_seconds()
+    now = datetime.now(timezone.utc)
+    remaining = (cooldown["until"] - now).total_seconds()
     return max(0.0, remaining)
 
 
@@ -715,6 +736,7 @@ async def _loop(bot):
             print(f"⏳ Next cycle in {remaining:.0f}s.")
             await asyncio.sleep(remaining)
 
+    _running = False
     print("🔴 Promotion Stopped")
 
 
@@ -722,7 +744,7 @@ async def _loop(bot):
 
 async def start_promotion(bot):
     global _running, _task
-    if _running:
+    if _running and _task is not None and not _task.done():
         return
     _running = True
     db = get_db()
@@ -753,7 +775,8 @@ async def stop_promotion():
 
 
 def is_running() -> bool:
-    return _running
+    global _running, _task
+    return bool(_running and _task is not None and not _task.done())
 
 
 async def restore_state(bot):
