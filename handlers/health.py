@@ -100,16 +100,19 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if promo_state == "COOLDOWN":
         lines.append("🔄 Promotion: COOLDOWN")
         lines.append(f"Reason: {cooldown_reason or 'FloodWait'}")
-        lines.append(
-            f"Cooldown Remaining: {max(0, int(cooldown_remaining // 60))} minutes"
-        )
+        if cooldown_remaining >= 60:
+            rem_m = int(cooldown_remaining // 60)
+            rem_s = int(cooldown_remaining % 60)
+            lines.append(f"Cooldown Remaining: {rem_m}m {rem_s}s ({int(cooldown_remaining)}s)")
+        else:
+            lines.append(f"Cooldown Remaining: {int(cooldown_remaining)}s")
     elif promo_state == "PAUSED":
         lines.append("🔄 Promotion: PAUSED")
         lines.append("Reason: Cycle failure rate exceeded threshold")
         lines.append(
             "🛡 Safety Status\n"
             "Failure Rate Protection: ACTIVE\n"
-            f"Threshold: {safety_threshold * 100:.0f}% if safety_threshold is not None else '50%'\n"
+            f"Threshold: {f'{safety_threshold * 100:.0f}%' if safety_threshold is not None else '50%'}\n"
             f"Last Cycle: {((safety_failure_rate * 100) if safety_failure_rate is not None else 0):.0f}%\n"
             "Status: PAUSED"
         )

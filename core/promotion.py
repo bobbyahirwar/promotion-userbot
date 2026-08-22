@@ -199,13 +199,14 @@ async def _get_cooldown_remaining_seconds(db) -> float:
 
 
 async def _clear_cooldown(db):
-    """Clear FloodWait cooldown state from MongoDB when the pause has ended."""
+    """Clear FloodWait / error cooldown state from MongoDB when the pause has ended."""
     await db.state.delete_many({
         "key": {
             "$in": [
                 "promotion_cooldown_until",
                 "promotion_cooldown_reason",
                 "promotion_cooldown_started_at",
+                "promotion_cooldown_duration",
             ]
         }
     })
@@ -287,16 +288,90 @@ async def _clear_safety_pause(db):
     })
 
 
-async def _trigger_cooldown(
+FLOODWAIT_SAFETY_BUFFER_SECONDS = 5
+
+
+async def _trigger_floodwait_cooldown(
+    db,
+    flood_wait_seconds: int,
+    safety_buffer_seconds: int = FLOODWAIT_SAFETY_BUFFER_SECONDS,
+    bot=None,
+    chat_id: int | None = None,
+):
+    """
+    Persist real Telegram FloodWait cooldown.
+    Calculates cooldown strictly from Telegram's e.value + safety buffer.
+    Never escalates to a fixed 30-minute cooldown.
+    """
+    now = datetime.now(timezone.utc)
+    wait_duration = max(1, int(flood_wait_seconds)) + max(0, int(safety_buffer_seconds))
+    cooldown_until = now + timedelta(seconds=wait_duration)
+
+    await db.state.update_one(
+        {"key": "promotion_cooldown_until"},
+        {"$set": {"value": cooldown_until, "updated_at": now}},
+        upsert=True,
+    )
+    await db.state.update_one(
+        {"key": "promotion_cooldown_reason"},
+        {"$set": {"value": "FloodWait", "updated_at": now}},
+        upsert=True,
+    )
+    await db.state.update_one(
+        {"key": "promotion_cooldown_started_at"},
+        {"$set": {"value": now, "updated_at": now}},
+        upsert=True,
+    )
+    await db.state.update_one(
+        {"key": "promotion_cooldown_duration"},
+        {"$set": {"value": wait_duration, "updated_at": now}},
+        upsert=True,
+    )
+
+    payload = {
+        "type": "flood_wait",
+        "category": "REAL TELEGRAM FLOODWAIT",
+        "reason": "FloodWait",
+        "telegram_wait_seconds": int(flood_wait_seconds),
+        "safety_buffer_seconds": int(safety_buffer_seconds),
+        "cooldown_seconds": wait_duration,
+        "cooldown_until": cooldown_until,
+        "chat_id": chat_id,
+        "started_at": now,
+    }
+    await _log_event(db, payload)
+
+    if bot and await _is_debug_mode(db):
+        await _notify(
+            bot,
+            "🚨 REAL TELEGRAM FLOODWAIT\n\n"
+            f"Telegram Wait: {int(flood_wait_seconds)} seconds\n"
+            f"Safety Buffer: {int(safety_buffer_seconds)} seconds\n"
+            f"Total Cooldown: {wait_duration} seconds\n"
+            f"Resume Time: {cooldown_until.strftime('%H:%M:%S UTC')}\n\n"
+            "Promotion cycle stopped safely. Loop will resume automatically after Telegram wait expires.",
+        )
+
+    print(
+        f"🚨 REAL TELEGRAM FLOODWAIT: Telegram required {int(flood_wait_seconds)}s (+{safety_buffer_seconds}s buffer). "
+        f"Paused until {cooldown_until.strftime('%H:%M:%S UTC')} ({wait_duration}s total)."
+    )
+
+
+async def _trigger_error_pause(
     db,
     reason: str,
+    consecutive_errors: int,
+    pause_seconds: int = 60,
     bot=None,
-    flood_wait_seconds: int | None = None,
-    consecutive_errors: int | None = None,
 ):
-    """Persist the existing global cooldown and stop the current promotion cycle."""
+    """
+    Temporary pause when consecutive non-FloodWait errors occur (e.g. network outage).
+    Does NOT label this as FloodWait and does NOT use 30-minute escalation.
+    """
     now = datetime.now(timezone.utc)
-    cooldown_until = now + timedelta(seconds=PROMOTION_COOLDOWN_SECONDS)
+    cooldown_until = now + timedelta(seconds=pause_seconds)
+
     await db.state.update_one(
         {"key": "promotion_cooldown_until"},
         {"$set": {"value": cooldown_until, "updated_at": now}},
@@ -312,50 +387,62 @@ async def _trigger_cooldown(
         {"$set": {"value": now, "updated_at": now}},
         upsert=True,
     )
+    await db.state.update_one(
+        {"key": "promotion_cooldown_duration"},
+        {"$set": {"value": pause_seconds, "updated_at": now}},
+        upsert=True,
+    )
 
     payload = {
-        "type": "promotion_cooldown",
+        "type": "error_pause",
+        "category": "OTHER SEND ERROR",
         "reason": reason,
-        "cooldown_seconds": PROMOTION_COOLDOWN_SECONDS,
+        "consecutive_errors": int(consecutive_errors),
+        "cooldown_seconds": pause_seconds,
         "cooldown_until": cooldown_until,
         "started_at": now,
     }
-    if flood_wait_seconds is not None:
-        payload["flood_wait_seconds"] = int(flood_wait_seconds)
-    if consecutive_errors is not None:
-        payload["consecutive_errors"] = int(consecutive_errors)
     await _log_event(db, payload)
 
     if bot and await _is_debug_mode(db):
-        if reason == "FloodWait":
-            await _notify(
-                bot,
-                "🚨 PROMOTION COOLDOWN\n\n"
-                "Reason: Telegram FloodWait\n"
-                f"Telegram Wait: {int(flood_wait_seconds or 0)} seconds\n"
-                f"Safety Cooldown: {PROMOTION_COOLDOWN_SECONDS} seconds\n\n"
-                "Promotion has been paused.",
-            )
-        else:
-            await _notify(
-                bot,
-                "🚨 PROMOTION AUTO-PAUSED\n\n"
-                f"Reason: {reason}\n"
-                f"Consecutive Errors: {int(consecutive_errors or 0)}\n"
-                f"Cooldown: {PROMOTION_COOLDOWN_SECONDS} seconds\n\n"
-                "Promotion has been paused.",
-            )
+        await _notify(
+            bot,
+            "⚠️ PROMOTION AUTO-PAUSED (NON-FLOODWAIT)\n\n"
+            f"Category: OTHER SEND ERROR\n"
+            f"Reason: {reason}\n"
+            f"Consecutive Errors: {int(consecutive_errors)}\n"
+            f"Pause Duration: {pause_seconds} seconds\n\n"
+            "Promotion temporarily paused.",
+        )
 
-    if reason == "FloodWait":
-        print(
-            f"🚨 FloodWait cooldown activated: {int(flood_wait_seconds or 0)}s wait, "
-            f"{PROMOTION_COOLDOWN_SECONDS}s pause until {cooldown_until.isoformat()}"
+    print(
+        f"⚠️ Promotion auto-paused (OTHER SEND ERROR): {reason}, "
+        f"consecutive errors={int(consecutive_errors)}, "
+        f"pause={pause_seconds}s until {cooldown_until.strftime('%H:%M:%S UTC')}"
+    )
+
+
+async def _trigger_cooldown(
+    db,
+    reason: str,
+    bot=None,
+    flood_wait_seconds: int | None = None,
+    consecutive_errors: int | None = None,
+):
+    """Routing helper to trigger appropriate cooldown without 30-minute escalation."""
+    if reason == "FloodWait" and flood_wait_seconds is not None:
+        await _trigger_floodwait_cooldown(
+            db,
+            flood_wait_seconds=flood_wait_seconds,
+            bot=bot,
         )
     else:
-        print(
-            f"🚨 Promotion auto-paused: {reason}, "
-            f"consecutive errors={int(consecutive_errors or 0)}, "
-            f"cooldown until {cooldown_until.isoformat()}"
+        await _trigger_error_pause(
+            db,
+            reason=reason,
+            consecutive_errors=consecutive_errors or 0,
+            pause_seconds=60,
+            bot=bot,
         )
 
 
@@ -370,13 +457,22 @@ async def _loop(bot):
         cycle_start = asyncio.get_event_loop().time()
         db = get_db()
 
-        # FloodWait cooldown is global and must block any new promotion sends
-        # until the pause expires, even after a process restart.
+        # Cooldown check: if FloodWait or temporary error pause is active,
+        # wait the exact remaining time and then clear state to resume normal cycle.
         if await _has_active_cooldown(db):
             remaining = await _get_cooldown_remaining_seconds(db)
-            print(f"⏳ Promotion cooldown active — waiting {remaining:.0f}s before resuming")
-            await asyncio.sleep(min(remaining, 60.0))
-            continue
+            if remaining > 0:
+                cooldown_state = await _get_cooldown_state(db)
+                reason_doc = cooldown_state.get("reason") if cooldown_state else None
+                reason_val = reason_doc.get("value") if isinstance(reason_doc, dict) else str(reason_doc or "cooldown")
+                print(f"⏳ Promotion {reason_val} active — waiting {remaining:.1f}s before resuming normal cycle")
+                while _running and remaining > 0:
+                    await asyncio.sleep(min(remaining, 5.0))
+                    remaining = await _get_cooldown_remaining_seconds(db)
+                if not _running:
+                    break
+            await _clear_cooldown(db)
+            print("✅ Promotion cooldown completed — resuming normal promotion cycle")
 
         messages = await db.messages.find().to_list(100)
         if not messages:
@@ -461,19 +557,25 @@ async def _loop(bot):
                 await _inc_stat(db, "total_sent")
 
             except FloodWait as e:
-                # FloodWait is not ignored: Telegram imposes the wait and the bot
-                # must stop the current cycle and enter a global cooldown.
+                # REAL TELEGRAM FLOODWAIT:
+                # Telegram has returned an authentic FloodWait error with duration in e.value.
                 wait_seconds = int(getattr(e, "value", 0) or 0)
-                error_detail = f"FloodWait {wait_seconds} seconds"
-                print(f"  ⚠️  FloodWait {wait_seconds}s — pausing promotion for cooldown")
+                safety_buffer = FLOODWAIT_SAFETY_BUFFER_SECONDS
+                total_wait = wait_seconds + safety_buffer
+                error_detail = f"REAL TELEGRAM FLOODWAIT: {wait_seconds}s (wait: {total_wait}s)"
+                print(f"  🚨 REAL TELEGRAM FLOODWAIT on {name}: Telegram required {wait_seconds}s. Pausing for {total_wait}s cooldown.")
                 await _inc_stat(db, "total_failed")
                 group_result = "failed"
-                await _trigger_cooldown(
+                await _trigger_floodwait_cooldown(
                     db,
-                    reason="FloodWait",
-                    bot=bot,
                     flood_wait_seconds=wait_seconds,
+                    safety_buffer_seconds=safety_buffer,
+                    bot=bot,
+                    chat_id=chat_id,
                 )
+                # Advance rotating message index so the next cycle moves to the next message in queue and does not immediately retry the same message
+                next_idx = (cycle_msg_idx + 1) % len(messages)
+                await _set_stat(db, "current_message_index", next_idx)
                 cooldown_triggered = True
                 break
 
@@ -481,18 +583,19 @@ async def _loop(bot):
                 # Temporary — count it toward the consecutive-error safety check,
                 # but do not deactivate the group or retry it in the same cycle.
                 wait_time = getattr(e, "value", 30)
-                error_detail = f"Slowmode {wait_time} seconds"
-                print(f"  ⚠️  SlowmodeWait {wait_time}s — counting as temporary failure")
+                error_detail = f"SlowmodeWait {wait_time} seconds"
+                print(f"  ⚠️  SlowmodeWait {wait_time}s on {name} — counting as temporary failure")
                 await _inc_stat(db, "total_failed")
                 group_result = "failed"
                 consecutive_error_count += 1
                 await _set_consecutive_error_count(db, consecutive_error_count)
                 if consecutive_error_count >= PROMOTION_MAX_CONSECUTIVE_ERRORS:
-                    await _trigger_cooldown(
+                    await _trigger_error_pause(
                         db,
-                        reason="Repeated temporary promotion errors",
-                        bot=bot,
+                        reason="Repeated temporary promotion errors (SlowmodeWait)",
                         consecutive_errors=consecutive_error_count,
+                        pause_seconds=60,
+                        bot=bot,
                     )
                     cooldown_triggered = True
                     break
@@ -523,11 +626,12 @@ async def _loop(bot):
                     consecutive_error_count += 1
                     await _set_consecutive_error_count(db, consecutive_error_count)
                     if consecutive_error_count >= PROMOTION_MAX_CONSECUTIVE_ERRORS:
-                        await _trigger_cooldown(
+                        await _trigger_error_pause(
                             db,
-                            reason="Repeated temporary promotion errors",
-                            bot=bot,
+                            reason="Repeated temporary promotion errors (ValueError)",
                             consecutive_errors=consecutive_error_count,
+                            pause_seconds=60,
+                            bot=bot,
                         )
                         cooldown_triggered = True
                         break
@@ -541,11 +645,12 @@ async def _loop(bot):
                 consecutive_error_count += 1
                 await _set_consecutive_error_count(db, consecutive_error_count)
                 if consecutive_error_count >= PROMOTION_MAX_CONSECUTIVE_ERRORS:
-                    await _trigger_cooldown(
+                    await _trigger_error_pause(
                         db,
                         reason="Repeated temporary promotion errors",
-                        bot=bot,
                         consecutive_errors=consecutive_error_count,
+                        pause_seconds=60,
+                        bot=bot,
                     )
                     cooldown_triggered = True
                     break
@@ -621,7 +726,7 @@ async def _loop(bot):
                 await asyncio.sleep(wait_seconds)
 
         if cooldown_triggered:
-            print("⏳ FloodWait cooldown active — current cycle stopped before remaining groups")
+            print("⏳ Cooldown triggered — current cycle stopped safely before remaining groups")
             continue
 
         # ── End-of-cycle summary ─────────────────────────────────────────────
