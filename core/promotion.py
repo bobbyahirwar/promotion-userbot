@@ -297,6 +297,8 @@ async def _trigger_floodwait_cooldown(
     safety_buffer_seconds: int = FLOODWAIT_SAFETY_BUFFER_SECONDS,
     bot=None,
     chat_id: int | None = None,
+    group_index: int | None = None,
+    total_groups: int | None = None,
 ):
     """
     Persist real Telegram FloodWait cooldown.
@@ -337,18 +339,23 @@ async def _trigger_floodwait_cooldown(
         "cooldown_seconds": wait_duration,
         "cooldown_until": cooldown_until,
         "chat_id": chat_id,
+        "group_index": group_index,
+        "total_groups": total_groups,
         "started_at": now,
     }
     await _log_event(db, payload)
 
     if bot and await _is_debug_mode(db):
+        pos_line = f"Paused at Group: {group_index}/{total_groups}\n" if (group_index and total_groups) else ""
+        next_line = f"Next Group on Resume: #{group_index + 1}\n" if (group_index and total_groups and group_index < total_groups) else ""
         await _notify(
             bot,
             "🚨 REAL TELEGRAM FLOODWAIT\n\n"
             f"Telegram Wait: {int(flood_wait_seconds)} seconds\n"
             f"Safety Buffer: {int(safety_buffer_seconds)} seconds\n"
             f"Total Cooldown: {wait_duration} seconds\n"
-            f"Resume Time: {cooldown_until.strftime('%H:%M:%S UTC')}\n\n"
+            f"Resume Time: {cooldown_until.strftime('%H:%M:%S UTC')}\n"
+            f"{pos_line}{next_line}\n"
             "Promotion cycle stopped safely. Loop will resume automatically after Telegram wait expires.",
         )
 
@@ -364,6 +371,8 @@ async def _trigger_error_pause(
     consecutive_errors: int,
     pause_seconds: int = 60,
     bot=None,
+    group_index: int | None = None,
+    total_groups: int | None = None,
 ):
     """
     Temporary pause when consecutive non-FloodWait errors occur (e.g. network outage).
@@ -400,6 +409,8 @@ async def _trigger_error_pause(
         "consecutive_errors": int(consecutive_errors),
         "cooldown_seconds": pause_seconds,
         "cooldown_until": cooldown_until,
+        "group_index": group_index,
+        "total_groups": total_groups,
         "started_at": now,
     }
     await _log_event(db, payload)
@@ -491,13 +502,12 @@ async def _loop(bot):
         consecutive_error_count = await _get_consecutive_error_count(db)
 
         # ── Rotating message selection ────────────────────────────────────────
-        # Load persisted index, pick one message for this entire cycle, then
-        # advance the pointer so the next cycle uses the following message.
+        # Load persisted index for the current cycle.
+        # It is only advanced when all groups in the cycle have been processed.
         idx_doc = await db.state.find_one({"key": "current_message_index"})
         raw_idx = idx_doc["value"] if idx_doc and "value" in idx_doc else 0
         cycle_msg_idx = int(raw_idx) % len(messages)
         current_msg   = messages[cycle_msg_idx]
-        print(f"📨 Cycle message: #{cycle_msg_idx + 1}/{len(messages)}")
 
         # ── Blacklist + inactive filter ──────────────────────────────────────
         from handlers.blacklist import get_blacklisted_ids
@@ -509,35 +519,81 @@ async def _loop(bot):
         active_groups = [g for g in groups if g["chat_id"] not in excluded]
 
         total_groups = len(active_groups)
-        successful = 0
-        skipped    = 0
-        failed     = 0
-        deactivated = 0
+        if total_groups == 0:
+            print(f"⚠️  No active groups available — waiting {PROMOTION_INTERVAL_SECONDS}s.")
+            await asyncio.sleep(PROMOTION_INTERVAL_SECONDS)
+            continue
+
+        # ── Group Progress Cursor ─────────────────────────────────────────────
+        # Load saved group cursor (if resuming after FloodWait or error pause)
+        cursor_doc = await db.state.find_one({"key": "promotion_group_cursor"})
+        group_cursor = 0
+        if cursor_doc and "value" in cursor_doc:
+            try:
+                group_cursor = int(cursor_doc["value"])
+            except (TypeError, ValueError):
+                group_cursor = 0
+
+        # Safe cursor boundary check to prevent index errors or skipping
+        if group_cursor < 0 or group_cursor >= total_groups:
+            group_cursor = 0
+            await db.state.update_one(
+                {"key": "promotion_group_cursor"},
+                {"$set": {"value": 0}},
+                upsert=True,
+            )
+
+        # ── Cycle Stats Accumulator ───────────────────────────────────────────
+        if group_cursor == 0:
+            successful = 0
+            skipped    = 0
+            failed     = 0
+            deactivated = 0
+            await db.state.delete_one({"key": "promotion_cycle_stats"})
+        else:
+            stats_doc = await db.state.find_one({"key": "promotion_cycle_stats"})
+            stats_val = stats_doc.get("value", {}) if stats_doc and isinstance(stats_doc.get("value"), dict) else {}
+            successful = int(stats_val.get("successful", 0))
+            skipped    = int(stats_val.get("skipped", 0))
+            failed     = int(stats_val.get("failed", 0))
+            deactivated = int(stats_val.get("deactivated", 0))
+
         cooldown_triggered = False
 
-        # ── Cycle-start notification (debug only) ─────────────────────────────
-        now_str = datetime.now(timezone.utc).strftime("%I:%M %p")
-        if debug:
-            cycle_start_text = (
-                "🚀 Promotion Cycle Started\n\n"
-                f"🕒 Time: {now_str} UTC\n"
-                f"📨 Message: #{cycle_msg_idx + 1}/{len(messages)}\n"
-                f"👥 Total Groups: {total_groups}\n\n"
-                "━━━━━━━━━━━━━━"
-            )
-            await _notify(bot, cycle_start_text)
+        if group_cursor > 0:
+            print(f"Promotion resuming from group {group_cursor + 1}/{total_groups}")
+            if debug:
+                await _notify(
+                    bot,
+                    "🔄 Promotion Resuming\n\n"
+                    f"Resuming from group {group_cursor + 1}/{total_groups}\n"
+                    f"📨 Message: #{cycle_msg_idx + 1}/{len(messages)}"
+                )
+        else:
+            print(f"📨 Cycle message: #{cycle_msg_idx + 1}/{len(messages)} ({total_groups} active groups)")
+            now_str = datetime.now(timezone.utc).strftime("%I:%M %p")
+            if debug:
+                cycle_start_text = (
+                    "🚀 Promotion Cycle Started\n\n"
+                    f"🕒 Time: {now_str} UTC\n"
+                    f"📨 Message: #{cycle_msg_idx + 1}/{len(messages)}\n"
+                    f"👥 Total Groups: {total_groups}\n\n"
+                    "━━━━━━━━━━━━━━"
+                )
+                await _notify(bot, cycle_start_text)
 
-        await _log_event(db, {
-            "type": "cycle_start",
-            "message_num": cycle_msg_idx + 1,
-            "total_messages": len(messages),
-            "total_groups": total_groups,
-        })
+            await _log_event(db, {
+                "type": "cycle_start",
+                "message_num": cycle_msg_idx + 1,
+                "total_messages": len(messages),
+                "total_groups": total_groups,
+            })
 
-        for i, group in enumerate(active_groups):
+        for i in range(group_cursor, total_groups):
             if not _running:
                 break
 
+            group = active_groups[i]
             chat_id = group["chat_id"]
             group_timer_start = asyncio.get_event_loop().time()
 
@@ -547,6 +603,8 @@ async def _loop(bot):
                 name = chat.title or str(chat_id)
             except Exception:
                 name = str(chat_id)
+
+            print(f"Promotion: sending group {i + 1}/{total_groups} ({name})")
 
             # "ok" | "skipped" | "failed" | "inactive"
             group_result = "ok"
@@ -563,19 +621,42 @@ async def _loop(bot):
                 safety_buffer = FLOODWAIT_SAFETY_BUFFER_SECONDS
                 total_wait = wait_seconds + safety_buffer
                 error_detail = f"REAL TELEGRAM FLOODWAIT: {wait_seconds}s (wait: {total_wait}s)"
-                print(f"  🚨 REAL TELEGRAM FLOODWAIT on {name}: Telegram required {wait_seconds}s. Pausing for {total_wait}s cooldown.")
+                
+                print(f"FloodWait received: {wait_seconds} seconds")
+                print(f"Promotion paused at group {i + 1}/{total_groups}")
+                
                 await _inc_stat(db, "total_failed")
                 group_result = "failed"
+                failed += 1
+
+                # Set next cursor position to the NEXT group (i + 1)
+                # This ensures we do NOT retry the failed group immediately, and do NOT restart from group 1.
+                next_cursor = i + 1
+                await db.state.update_one(
+                    {"key": "promotion_group_cursor"},
+                    {"$set": {"value": next_cursor}},
+                    upsert=True,
+                )
+                await db.state.update_one(
+                    {"key": "promotion_cycle_stats"},
+                    {"$set": {"value": {
+                        "successful": successful,
+                        "failed": failed,
+                        "skipped": skipped,
+                        "deactivated": deactivated,
+                    }}},
+                    upsert=True,
+                )
+
                 await _trigger_floodwait_cooldown(
                     db,
                     flood_wait_seconds=wait_seconds,
                     safety_buffer_seconds=safety_buffer,
                     bot=bot,
                     chat_id=chat_id,
+                    group_index=i + 1,
+                    total_groups=total_groups,
                 )
-                # Advance rotating message index so the next cycle moves to the next message in queue and does not immediately retry the same message
-                next_idx = (cycle_msg_idx + 1) % len(messages)
-                await _set_stat(db, "current_message_index", next_idx)
                 cooldown_triggered = True
                 break
 
@@ -587,15 +668,34 @@ async def _loop(bot):
                 print(f"  ⚠️  SlowmodeWait {wait_time}s on {name} — counting as temporary failure")
                 await _inc_stat(db, "total_failed")
                 group_result = "failed"
+                failed += 1
                 consecutive_error_count += 1
                 await _set_consecutive_error_count(db, consecutive_error_count)
                 if consecutive_error_count >= PROMOTION_MAX_CONSECUTIVE_ERRORS:
+                    next_cursor = i + 1
+                    await db.state.update_one(
+                        {"key": "promotion_group_cursor"},
+                        {"$set": {"value": next_cursor}},
+                        upsert=True,
+                    )
+                    await db.state.update_one(
+                        {"key": "promotion_cycle_stats"},
+                        {"$set": {"value": {
+                            "successful": successful,
+                            "failed": failed,
+                            "skipped": skipped,
+                            "deactivated": deactivated,
+                        }}},
+                        upsert=True,
+                    )
                     await _trigger_error_pause(
                         db,
                         reason="Repeated temporary promotion errors (SlowmodeWait)",
                         consecutive_errors=consecutive_error_count,
                         pause_seconds=60,
                         bot=bot,
+                        group_index=i + 1,
+                        total_groups=total_groups,
                     )
                     cooldown_triggered = True
                     break
@@ -607,6 +707,7 @@ async def _loop(bot):
                 await _inc_stat(db, "total_failed")
                 await mark_inactive(chat_id, error_detail)
                 group_result = "inactive"
+                deactivated += 1
 
             except ValueError as e:
                 # pyrogram/utils.py:get_peer_type() raises a plain ValueError
@@ -618,20 +719,40 @@ async def _loop(bot):
                     await _inc_stat(db, "total_failed")
                     await mark_inactive(chat_id, f"PeerIdInvalid(ValueError): {e}")
                     group_result = "inactive"
+                    deactivated += 1
                 else:
                     error_detail = f"ValueError: {e}"
                     print(f"  ⚠️  ValueError on {name}: {e} — counting as temporary failure")
                     await _inc_stat(db, "total_failed")
                     group_result = "failed"
+                    failed += 1
                     consecutive_error_count += 1
                     await _set_consecutive_error_count(db, consecutive_error_count)
                     if consecutive_error_count >= PROMOTION_MAX_CONSECUTIVE_ERRORS:
+                        next_cursor = i + 1
+                        await db.state.update_one(
+                            {"key": "promotion_group_cursor"},
+                            {"$set": {"value": next_cursor}},
+                            upsert=True,
+                        )
+                        await db.state.update_one(
+                            {"key": "promotion_cycle_stats"},
+                            {"$set": {"value": {
+                                "successful": successful,
+                                "failed": failed,
+                                "skipped": skipped,
+                                "deactivated": deactivated,
+                            }}},
+                            upsert=True,
+                        )
                         await _trigger_error_pause(
                             db,
                             reason="Repeated temporary promotion errors (ValueError)",
                             consecutive_errors=consecutive_error_count,
                             pause_seconds=60,
                             bot=bot,
+                            group_index=i + 1,
+                            total_groups=total_groups,
                         )
                         cooldown_triggered = True
                         break
@@ -642,15 +763,34 @@ async def _loop(bot):
                 print(f"  ⚠️  Temporary error on {name}: {e} — counting as temporary failure")
                 await _inc_stat(db, "total_failed")
                 group_result = "failed"
+                failed += 1
                 consecutive_error_count += 1
                 await _set_consecutive_error_count(db, consecutive_error_count)
                 if consecutive_error_count >= PROMOTION_MAX_CONSECUTIVE_ERRORS:
+                    next_cursor = i + 1
+                    await db.state.update_one(
+                        {"key": "promotion_group_cursor"},
+                        {"$set": {"value": next_cursor}},
+                        upsert=True,
+                    )
+                    await db.state.update_one(
+                        {"key": "promotion_cycle_stats"},
+                        {"$set": {"value": {
+                            "successful": successful,
+                            "failed": failed,
+                            "skipped": skipped,
+                            "deactivated": deactivated,
+                        }}},
+                        upsert=True,
+                    )
                     await _trigger_error_pause(
                         db,
                         reason="Repeated temporary promotion errors",
                         consecutive_errors=consecutive_error_count,
                         pause_seconds=60,
                         bot=bot,
+                        group_index=i + 1,
+                        total_groups=total_groups,
                     )
                     cooldown_triggered = True
                     break
@@ -671,11 +811,27 @@ async def _loop(bot):
             elif group_result == "inactive":
                 status_emoji = "🚫 Deactivated"
                 label        = "Deactivated (permanent error)"
-                deactivated += 1
             else:
                 status_emoji = "❌ Failed"
                 label        = "Failed (temporary)"
-                failed      += 1
+
+            # Advance cursor and save cycle progress in state
+            next_cursor = i + 1
+            await db.state.update_one(
+                {"key": "promotion_group_cursor"},
+                {"$set": {"value": next_cursor}},
+                upsert=True,
+            )
+            await db.state.update_one(
+                {"key": "promotion_cycle_stats"},
+                {"$set": {"value": {
+                    "successful": successful,
+                    "failed": failed,
+                    "skipped": skipped,
+                    "deactivated": deactivated,
+                }}},
+                upsert=True,
+            )
 
             remaining_groups = total_groups - (i + 1)
             print(f"[{i + 1}/{total_groups}] {name} -> {label}")
@@ -729,7 +885,18 @@ async def _loop(bot):
             print("⏳ Cooldown triggered — current cycle stopped safely before remaining groups")
             continue
 
+        if not _running:
+            break
+
         # ── End-of-cycle summary ─────────────────────────────────────────────
+        # All groups in this cycle completed! Reset group cursor and cycle stats for the next cycle.
+        await db.state.update_one(
+            {"key": "promotion_group_cursor"},
+            {"$set": {"value": 0}},
+            upsert=True,
+        )
+        await db.state.delete_one({"key": "promotion_cycle_stats"})
+
         await _set_stat(db, "last_promotion_time",
                         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
@@ -772,7 +939,7 @@ async def _loop(bot):
             break
 
         # Advance the rotating index and persist it for the next cycle /
-        # restart.  Wraps via modulo when fetched at the top of the next cycle.
+        # restart. Wraps via modulo when fetched at the top of the next cycle.
         next_idx = (cycle_msg_idx + 1) % len(messages)
         await _set_stat(db, "current_message_index", next_idx)
 
@@ -870,6 +1037,14 @@ async def stop_promotion():
         {"$set": {"value": False}},
         upsert=True,
     )
+    await db.state.delete_many({
+        "key": {
+            "$in": [
+                "promotion_group_cursor",
+                "promotion_cycle_stats",
+            ]
+        }
+    })
     if _task and not _task.done():
         _task.cancel()
         try:

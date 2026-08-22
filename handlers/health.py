@@ -56,6 +56,7 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     promo_state = "🟢 Running" if is_running() else "🔴 Stopped"
     cooldown_reason = None
     cooldown_remaining = 0.0
+    cursor_val = 0
     safety_paused = False
     safety_failure_rate = None
     safety_threshold = None
@@ -93,6 +94,10 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
             safety_threshold_doc = await db.state.find_one({"key": "promotion_safety_threshold"})
             if safety_threshold_doc and safety_threshold_doc.get("value") is not None:
                 safety_threshold = float(safety_threshold_doc["value"])
+
+            cursor_doc = await db.state.find_one({"key": "promotion_group_cursor"})
+            if cursor_doc and cursor_doc.get("value") is not None:
+                cursor_val = int(cursor_doc["value"])
         except Exception:
             cooldown_reason = None
             cooldown_remaining = 0.0
@@ -106,6 +111,8 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"Cooldown Remaining: {rem_m}m {rem_s}s ({int(cooldown_remaining)}s)")
         else:
             lines.append(f"Cooldown Remaining: {int(cooldown_remaining)}s")
+        if cursor_val > 0:
+            lines.append(f"Next Group on Resume: #{cursor_val + 1}")
     elif promo_state == "PAUSED":
         lines.append("🔄 Promotion: PAUSED")
         lines.append("Reason: Cycle failure rate exceeded threshold")

@@ -158,9 +158,12 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif etype == "flood_wait":
             wait_s = ev.get("telegram_wait_seconds", ev.get("flood_wait_seconds", "?"))
             tot_s = ev.get("cooldown_seconds", "?")
+            grp_info = ""
+            if ev.get("group_index") and ev.get("total_groups"):
+                grp_info = f" | Paused at {ev.get('group_index')}/{ev.get('total_groups')}"
             lines.append(
                 f"[{ts_str}] 🚨 REAL TELEGRAM FLOODWAIT — "
-                f"Wait: {wait_s}s (Cooldown: {tot_s}s)"
+                f"Wait: {wait_s}s (Cooldown: {tot_s}s){grp_info}"
             )
         elif etype == "error_pause":
             lines.append(
