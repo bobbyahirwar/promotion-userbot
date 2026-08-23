@@ -84,6 +84,34 @@ async def _set_stat(db, key: str, value):
     )
 
 
+async def _get_current_message_index(db) -> int:
+    """Return persisted message index from state or stats collection."""
+    doc = await db.state.find_one({"key": "current_message_index"})
+    if not doc or doc.get("value") is None:
+        doc = await db.stats.find_one({"key": "current_message_index"})
+    if doc and doc.get("value") is not None:
+        try:
+            return int(doc["value"])
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+async def _set_current_message_index(db, index: int):
+    """Persist message index for the next cycle across state and stats collections."""
+    idx = max(0, int(index))
+    await db.state.update_one(
+        {"key": "current_message_index"},
+        {"$set": {"value": idx}},
+        upsert=True,
+    )
+    await db.stats.update_one(
+        {"key": "current_message_index"},
+        {"$set": {"value": idx}},
+        upsert=True,
+    )
+
+
 async def _notify(bot, text: str):
     """Send a Telegram message to the owner. Never raises — log failures only."""
     try:
@@ -504,8 +532,7 @@ async def _loop(bot):
         # ── Rotating message selection ────────────────────────────────────────
         # Load persisted index for the current cycle.
         # It is only advanced when all groups in the cycle have been processed.
-        idx_doc = await db.state.find_one({"key": "current_message_index"})
-        raw_idx = idx_doc["value"] if idx_doc and "value" in idx_doc else 0
+        raw_idx = await _get_current_message_index(db)
         cycle_msg_idx = int(raw_idx) % len(messages)
         current_msg   = messages[cycle_msg_idx]
 
@@ -870,7 +897,7 @@ async def _loop(bot):
             # Conservative inter-group rate limit for promotions only.
             # This delay is intentionally placed only between actual promotion
             # sends, not between owner/debug notifications. It does not affect
-            # the 5-minute cycle cadence logic at the end of the cycle.
+            # the 10-minute cycle cadence logic at the end of the cycle.
             if _running and i < total_groups - 1:
                 wait_seconds = random.uniform(
                     PROMOTION_MIN_DELAY_SECONDS,
@@ -941,11 +968,11 @@ async def _loop(bot):
         # Advance the rotating index and persist it for the next cycle /
         # restart. Wraps via modulo when fetched at the top of the next cycle.
         next_idx = (cycle_msg_idx + 1) % len(messages)
-        await _set_stat(db, "current_message_index", next_idx)
+        await _set_current_message_index(db, next_idx)
 
-        # ── Exact 5-minute cadence: subtract time already spent ──────────────
+        # ── Exact 10-minute cadence: subtract time already spent ─────────────
         elapsed   = asyncio.get_event_loop().time() - cycle_start
-        remaining = max(0.0, 300.0 - elapsed)
+        remaining = max(0.0, float(PROMOTION_INTERVAL_SECONDS) - elapsed)
 
         next_cycle_min = int(remaining // 60)
         next_cycle_sec = int(remaining % 60)

@@ -28,8 +28,8 @@ OWNER_ID = int(os.getenv("OWNER_ID"))
 MONGO_URI = os.getenv("MONGO_URI")
 
 # Seconds between promotion cycles. Override via PROMOTION_INTERVAL_SECONDS
-# environment variable; defaults to 60.
-PROMOTION_INTERVAL_SECONDS = int(os.getenv("PROMOTION_INTERVAL_SECONDS", 60))
+# environment variable; defaults to 600 (10 minutes).
+PROMOTION_INTERVAL_SECONDS = int(os.getenv("PROMOTION_INTERVAL_SECONDS", 600))
 
 # Promotion safety settings use built-in defaults so Render does not need any
 # new environment variables for these protections. Keep the existing required
