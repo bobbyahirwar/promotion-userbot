@@ -31,6 +31,11 @@ MONGO_URI = os.getenv("MONGO_URI")
 # environment variable; defaults to 600 (10 minutes).
 PROMOTION_INTERVAL_SECONDS = int(os.getenv("PROMOTION_INTERVAL_SECONDS", 600))
 
+# Maximum random variation on either side of the configured cycle interval.
+PROMOTION_INTERVAL_VARIATION_SECONDS = int(
+    os.getenv("PROMOTION_INTERVAL_VARIATION_SECONDS", 60)
+)
+
 # Promotion safety settings use built-in defaults so Render does not need any
 # new environment variables for these protections. Keep the existing required
 # app env vars unchanged.

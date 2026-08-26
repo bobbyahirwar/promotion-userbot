@@ -28,6 +28,7 @@ _PERMANENT_ERRORS = (
 
 from config import (
     PROMOTION_INTERVAL_SECONDS,
+    PROMOTION_INTERVAL_VARIATION_SECONDS,
     PROMOTION_MIN_DELAY_SECONDS,
     PROMOTION_MAX_DELAY_SECONDS,
     PROMOTION_COOLDOWN_SECONDS,
@@ -970,9 +971,13 @@ async def _loop(bot):
         next_idx = (cycle_msg_idx + 1) % len(messages)
         await _set_current_message_index(db, next_idx)
 
-        # ── Exact 10-minute cadence: subtract time already spent ─────────────
-        elapsed   = asyncio.get_event_loop().time() - cycle_start
-        remaining = max(0.0, float(PROMOTION_INTERVAL_SECONDS) - elapsed)
+        # Vary cycle cadence while subtracting time already spent
+        next_interval = random.uniform(
+            PROMOTION_INTERVAL_SECONDS - PROMOTION_INTERVAL_VARIATION_SECONDS,
+            PROMOTION_INTERVAL_SECONDS + PROMOTION_INTERVAL_VARIATION_SECONDS,
+        )
+        elapsed = asyncio.get_event_loop().time() - cycle_start
+        remaining = max(0.0, next_interval - elapsed)
 
         next_cycle_min = int(remaining // 60)
         next_cycle_sec = int(remaining % 60)
