@@ -36,6 +36,8 @@ from config import (
     PROMOTION_MAX_FAILURE_RATE,
     PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE,
     OWNER_ID,
+    PROMOTION_LONG_FLOODWAIT_THRESHOLD_SECONDS,
+    EXTRA_LONG_FLOODWAIT_BUFFER_SECONDS,
 )
 from database import get_db
 from core.userbot import userbot
@@ -486,6 +488,18 @@ async def _trigger_cooldown(
         )
 
 
+async def _get_long_floodwait_resume_until(db):
+    """Return the persisted long FloodWait resume time, if present."""
+    doc = await db.state.find_one({"key": "promotion_long_floodwait_resume_until"})
+    if not doc or not doc.get("value"):
+        return None
+    return _normalize_datetime(doc.get("value"))
+
+
+async def _clear_long_floodwait_pause(db):
+    await db.state.delete_one({"key": "promotion_long_floodwait_resume_until"})
+
+
 # ── Promotion loop ────────────────────────────────────────────────────────────
 
 async def _loop(bot):
@@ -496,6 +510,20 @@ async def _loop(bot):
     while _running:
         cycle_start = asyncio.get_event_loop().time()
         db = get_db()
+
+        long_floodwait_expired = False
+        long_floodwait_until = await _get_long_floodwait_resume_until(db)
+        if long_floodwait_until:
+            remaining = (long_floodwait_until - datetime.now(timezone.utc)).total_seconds()
+            if remaining > 0:
+                print(f"⏳ Long FloodWait active — waiting {remaining:.1f}s before resuming")
+                while _running and remaining > 0:
+                    await asyncio.sleep(min(remaining, 5.0))
+                    remaining = (long_floodwait_until - datetime.now(timezone.utc)).total_seconds()
+                if not _running:
+                    break
+            await _clear_long_floodwait_pause(db)
+            long_floodwait_expired = True
 
         # Cooldown check: if FloodWait or temporary error pause is active,
         # wait the exact remaining time and then clear state to resume normal cycle.
@@ -570,6 +598,9 @@ async def _loop(bot):
                 {"$set": {"value": 0}},
                 upsert=True,
             )
+
+        if long_floodwait_expired:
+            print(f"FloodWait expired — resuming from group {group_cursor + 1}/{total_groups}")
 
         # ── Cycle Stats Accumulator ───────────────────────────────────────────
         if group_cursor == 0:
@@ -676,15 +707,32 @@ async def _loop(bot):
                     upsert=True,
                 )
 
-                await _trigger_floodwait_cooldown(
-                    db,
-                    flood_wait_seconds=wait_seconds,
-                    safety_buffer_seconds=safety_buffer,
-                    bot=bot,
-                    chat_id=chat_id,
-                    group_index=i + 1,
-                    total_groups=total_groups,
-                )
+                if wait_seconds > PROMOTION_LONG_FLOODWAIT_THRESHOLD_SECONDS:
+                    total_wait = wait_seconds + EXTRA_LONG_FLOODWAIT_BUFFER_SECONDS
+                    resume_until = datetime.now(timezone.utc) + timedelta(seconds=total_wait)
+                    await db.state.update_one(
+                        {"key": "promotion_long_floodwait_resume_until"},
+                        {"$set": {
+                            "value": resume_until,
+                            "updated_at": datetime.now(timezone.utc),
+                            "duration": total_wait,
+                            "telegram_wait_seconds": wait_seconds,
+                        }},
+                        upsert=True,
+                    )
+                    print(f"Long FloodWait detected: {wait_seconds} seconds")
+                    print(f"Promotion paused until: {resume_until.isoformat()}")
+                    print("Promotion will automatically resume after FloodWait")
+                else:
+                    await _trigger_floodwait_cooldown(
+                        db,
+                        flood_wait_seconds=wait_seconds,
+                        safety_buffer_seconds=safety_buffer,
+                        bot=bot,
+                        chat_id=chat_id,
+                        group_index=i + 1,
+                        total_groups=total_groups,
+                    )
                 cooldown_triggered = True
                 break
 

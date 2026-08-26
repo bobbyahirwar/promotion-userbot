@@ -1,0 +1,816 @@
+[1mdiff --cc config.py[m
+[1mindex 8868b96,07df904..745c418[m
+[1m--- a/config.py[m
+[1m+++ b/config.py[m
+[36m@@@ -28,12 -28,8 +28,8 @@@[m [mOWNER_ID = int(os.getenv("OWNER_ID")[m
+  MONGO_URI = os.getenv("MONGO_URI")[m
+  [m
+  # Seconds between promotion cycles. Override via PROMOTION_INTERVAL_SECONDS[m
+[31m- # environment variable; defaults to 600.[m
+[31m -# environment variable; defaults to 60.[m
+[31m -PROMOTION_INTERVAL_SECONDS = int(os.getenv("PROMOTION_INTERVAL_SECONDS", 60))[m
+[32m++# environment variable; defaults to 600 (10 minutes).[m
+[32m +PROMOTION_INTERVAL_SECONDS = int(os.getenv("PROMOTION_INTERVAL_SECONDS", 600))[m
+[31m- # Maximum random variation on either side of the configured cycle interval.[m
+[31m- PROMOTION_INTERVAL_VARIATION_SECONDS = int([m
+[31m-     os.getenv("PROMOTION_INTERVAL_VARIATION_SECONDS", 60)[m
+[31m- )[m
+  [m
+  # Promotion safety settings use built-in defaults so Render does not need any[m
+  # new environment variables for these protections. Keep the existing required[m
+[1mdiff --cc core/promotion.py[m
+[1mindex f6e678e,9f5e130..ff13254[m
+[1m--- a/core/promotion.py[m
+[1m+++ b/core/promotion.py[m
+[36m@@@ -85,6 -84,6 +84,34 @@@[m [masync def _set_stat(db, key: str, value[m
+      )[m
+  [m
+  [m
+[32m++async def _get_current_message_index(db) -> int:[m
+[32m++    """Return persisted message index from state or stats collection."""[m
+[32m++    doc = await db.state.find_one({"key": "current_message_index"})[m
+[32m++    if not doc or doc.get("value") is None:[m
+[32m++        doc = await db.stats.find_one({"key": "current_message_index"})[m
+[32m++    if doc and doc.get("value") is not None:[m
+[32m++        try:[m
+[32m++            return int(doc["value"])[m
+[32m++        except (TypeError, ValueError):[m
+[32m++            return 0[m
+[32m++    return 0[m
+[32m++[m
+[32m++[m
+[32m++async def _set_current_message_index(db, index: int):[m
+[32m++    """Persist message index for the next cycle across state and stats collections."""[m
+[32m++    idx = max(0, int(index))[m
+[32m++    await db.state.update_one([m
+[32m++        {"key": "current_message_index"},[m
+[32m++        {"$set": {"value": idx}},[m
+[32m++        upsert=True,[m
+[32m++    )[m
+[32m++    await db.stats.update_one([m
+[32m++        {"key": "current_message_index"},[m
+[32m++        {"$set": {"value": idx}},[m
+[32m++        upsert=True,[m
+[32m++    )[m
+[32m++[m
+[32m++[m
+  async def _notify(bot, text: str):[m
+      """Send a Telegram message to the owner. Never raises — log failures only."""[m
+      try:[m
+[36m@@@ -125,6 -124,6 +152,30 @@@[m [masync def _is_debug_mode(db) -> bool[m
+          return False[m
+  [m
+  [m
+[32m++def _normalize_datetime(dt) -> datetime | None:[m
+[32m++    """Safely convert naive or aware datetime/ISO string into timezone-aware UTC datetime."""[m
+[32m++    if dt is None:[m
+[32m++        return None[m
+[32m++    if isinstance(dt, datetime):[m
+[32m++        if dt.tzinfo is None:[m
+[32m++            return dt.replace(tzinfo=timezone.utc)[m
+[32m++        return dt.astimezone(timezone.utc)[m
+[32m++    if isinstance(dt, (int, float)):[m
+[32m++        try:[m
+[32m++            return datetime.fromtimestamp(dt, tz=timezone.utc)[m
+[32m++        except Exception:[m
+[32m++            return None[m
+[32m++    if isinstance(dt, str):[m
+[32m++        try:[m
+[32m++            parsed = datetime.fromisoformat(dt.replace("Z", "+00:00"))[m
+[32m++            if parsed.tzinfo is None:[m
+[32m++                return parsed.replace(tzinfo=timezone.utc)[m
+[32m++            return parsed.astimezone(timezone.utc)[m
+[32m++        except Exception:[m
+[32m++            return None[m
+[32m++    return None[m
+[32m++[m
+[32m++[m
+  async def _get_consecutive_error_count(db) -> int:[m
+      """Return the persisted consecutive temporary-error counter."""[m
+      doc = await db.state.find_one({"key": "promotion_consecutive_errors"})[m
+[36m@@@ -150,12 -149,12 +201,8 @@@[m [masync def _get_cooldown_state(db)[m
+      doc = await db.state.find_one({"key": "promotion_cooldown_until"})[m
+      if not doc or not doc.get("value"):[m
+          return None[m
+[31m--    try:[m
+[31m--        if isinstance(doc["value"], datetime):[m
+[31m--            until = doc["value"][m
+[31m--        else:[m
+[31m--            until = datetime.fromisoformat(str(doc["value"]).replace("Z", "+00:00"))[m
+[31m--    except Exception:[m
+[32m++    until = _normalize_datetime(doc.get("value"))[m
+[32m++    if not until:[m
+          return None[m
+      return {"until": until, "reason": await db.state.find_one({"key": "promotion_cooldown_reason"})}[m
+  [m
+[36m@@@ -163,7 -162,7 +210,7 @@@[m
+  async def _has_active_cooldown(db) -> bool:[m
+      """True when the promo loop is globally paused by a FloodWait cooldown."""[m
+      cooldown = await _get_cooldown_state(db)[m
+[31m--    if not cooldown:[m
+[32m++    if not cooldown or not cooldown.get("until"):[m
+          return False[m
+      now = datetime.now(timezone.utc)[m
+      return now < cooldown["until"][m
+[36m@@@ -172,20 -171,20 +219,22 @@@[m
+  async def _get_cooldown_remaining_seconds(db) -> float:[m
+      """Return remaining cooldown seconds; 0 when no active cooldown exists."""[m
+      cooldown = await _get_cooldown_state(db)[m
+[31m--    if not cooldown:[m
+[32m++    if not cooldown or not cooldown.get("until"):[m
+          return 0.0[m
+[31m--    remaining = (cooldown["until"] - datetime.now(timezone.utc)).total_seconds()[m
+[32m++    now = datetime.now(timezone.utc)[m
+[32m++    remaining = (cooldown["until"] - now).total_seconds()[m
+      return max(0.0, remaining)[m
+  [m
+  [m
+  async def _clear_cooldown(db):[m
+[31m--    """Clear FloodWait cooldown state from MongoDB when the pause has ended."""[m
+[32m++    """Clear FloodWait / error cooldown state from MongoDB when the pause has ended."""[m
+      await db.state.delete_many({[m
+          "key": {[m
+              "$in": [[m
+                  "promotion_cooldown_until",[m
+                  "promotion_cooldown_reason",[m
+                  "promotion_cooldown_started_at",[m
+[32m++                "promotion_cooldown_duration",[m
+              ][m
+          }[m
+      })[m
+[36m@@@ -267,16 -266,16 +316,99 @@@[m [masync def _clear_safety_pause(db)[m
+      })[m
+  [m
+  [m
+[31m--async def _trigger_cooldown([m
+[32m++FLOODWAIT_SAFETY_BUFFER_SECONDS = 5[m
+[32m++[m
+[32m++[m
+[32m++async def _trigger_floodwait_cooldown([m
+[32m++    db,[m
+[32m++    flood_wait_seconds: int,[m
+[32m++    safety_buffer_seconds: int = FLOODWAIT_SAFETY_BUFFER_SECONDS,[m
+[32m++    bot=None,[m
+[32m++    chat_id: int | None = None,[m
+[32m++    group_index: int | None = None,[m
+[32m++    total_groups: int | None = None,[m
+[32m++):[m
+[32m++    """[m
+[32m++    Persist real Telegram FloodWait cooldown.[m
+[32m++    Calculates cooldown strictly from Telegram's e.value + safety buffer.[m
+[32m++    Never escalates to a fixed 30-minute cooldown.[m
+[32m++    """[m
+[32m++    now = datetime.now(timezone.utc)[m
+[32m++    wait_duration = max(1, int(flood_wait_seconds)) + max(0, int(safety_buffer_seconds))[m
+[32m++    cooldown_until = now + timedelta(seconds=wait_duration)[m
+[32m++[m
+[32m++    await db.state.update_one([m
+[32m++        {"key": "promotion_cooldown_until"},[m
+[32m++        {"$set": {"value": cooldown_until, "updated_at": now}},[m
+[32m++        upsert=True,[m
+[32m++    )[m
+[32m++    await db.state.update_one([m
+[32m++        {"key": "promotion_cooldown_reason"},[m
+[32m++        {"$set": {"value": "FloodWait", "updated_at": now}},[m
+[32m++        upsert=True,[m
+[32m++    )[m
+[32m++    await db.state.update_one([m
+[32m++        {"key": "promotion_cooldown_started_at"},[m
+[32m++        {"$set": {"value": now, "updated_at": now}},[m
+[32m++        upsert=True,[m
+[32m++    )[m
+[32m++    await db.state.update_one([m
+[32m++        {"key": "promotion_cooldown_duration"},[m
+[32m++        {"$set": {"value": wait_duration, "updated_at": now}},[m
+[32m++        upsert=True,[m
+[32m++    )[m
+[32m++[m
+[32m++    payload = {[m
+[32m++        "type": "flood_wait",[m
+[32m++        "category": "REAL TELEGRAM FLOODWAIT",[m
+[32m++        "reason": "FloodWait",[m
+[32m++        "telegram_wait_seconds": int(flood_wait_seconds),[m
+[32m++        "safety_buffer_seconds": int(safety_buffer_seconds),[m
+[32m++        "cooldown_seconds": wait_duration,[m
+[32m++        "cooldown_until": cooldown_until,[m
+[32m++        "chat_id": chat_id,[m
+[32m++        "group_index": group_index,[m
+[32m++        "total_groups": total_groups,[m
+[32m++        "started_at": now,[m
+[32m++    }[m
+[32m++    await _log_event(db, payload)[m
+[32m++[m
+[32m++    if bot and await _is_debug_mode(db):[m
+[32m++        pos_line = f"Paused at Group: {group_index}/{total_groups}\n" if (group_index and total_groups) else ""[m
+[32m++        next_line = f"Next Group on Resume: #{group_index + 1}\n" if (group_index and total_groups and group_index < total_groups) else ""[m
+[32m++        await _notify([m
+[32m++            bot,[m
+[32m++            "🚨 REAL TELEGRAM FLOODWAIT\n\n"[m
+[32m++            f"Telegram Wait: {int(flood_wait_seconds)} seconds\n"[m
+[32m++            f"Safety Buffer: {int(safety_buffer_seconds)} seconds\n"[m
+[32m++            f"Total Cooldown: {wait_duration} seconds\n"[m
+[32m++            f"Resume Time: {cooldown_until.strftime('%H:%M:%S UTC')}\n"[m
+[32m++            f"{pos_line}{next_line}\n"[m
+[32m++            "Promotion cycle stopped safely. Loop will resume automatically after Telegram wait expires.",[m
+[32m++        )[m
+[32m++[m
+[32m++    print([m
+[32m++        f"🚨 REAL TELEGRAM FLOODWAIT: Telegram required {int(flood_wait_seconds)}s (+{safety_buffer_seconds}s buffer). "[m
+[32m++        f"Paused until {cooldown_until.strftime('%H:%M:%S UTC')} ({wait_duration}s total)."[m
+[32m++    )[m
+[32m++[m
+[32m++[m
+[32m++async def _trigger_error_pause([m
+      db,[m
+      reason: str,[m
+[32m++    consecutive_errors: int,[m
+[32m++    pause_seconds: int = 60,[m
+      bot=None,[m
+[31m--    flood_wait_seconds: int | None = None,[m
+[31m--    consecutive_errors: int | None = None,[m
+[32m++    group_index: int | None = None,[m
+[32m++    total_groups: int | None = None,[m
+  ):[m
+[31m--    """Persist the existing global cooldown and stop the current promotion cycle."""[m
+[32m++    """[m
+[32m++    Temporary pause when consecutive non-FloodWait errors occur (e.g. network outage).[m
+[32m++    Does NOT label this as FloodWait and does NOT use 30-minute escalation.[m
+[32m++    """[m
+      now = datetime.now(timezone.utc)[m
+[31m--    cooldown_until = now + timedelta(seconds=PROMOTION_COOLDOWN_SECONDS)[m
+[32m++    cooldown_until = now + timedelta(seconds=pause_seconds)[m
+[32m++[m
+      await db.state.update_one([m
+          {"key": "promotion_cooldown_until"},[m
+          {"$set": {"value": cooldown_until, "updated_at": now}},[m
+[36m@@@ -292,50 -291,50 +424,64 @@@[m
+          {"$set": {"value": now, "updated_at": now}},[m
+          upsert=True,[m
+      )[m
+[32m++    await db.state.update_one([m
+[32m++        {"key": "promotion_cooldown_duration"},[m
+[32m++        {"$set": {"value": pause_seconds, "updated_at": now}},[m
+[32m++        upsert=True,[m
+[32m++    )[m
+  [m
+      payload = {[m
+[31m--        "type": "promotion_cooldown",[m
+[32m++        "type": "error_pause",[m
+[32m++        "category": "OTHER SEND ERROR",[m
+          "reason": reason,[m
+[31m--        "cooldown_seconds": PROMOTION_COOLDOWN_SECONDS,[m
+[32m++        "consecutive_errors": int(consecutive_errors),[m
+[32m++        "cooldown_seconds": pause_seconds,[m
+          "cooldown_until": cooldown_until,[m
+[32m++        "group_index": group_index,[m
+[32m++        "total_groups": total_groups,[m
+          "started_at": now,[m
+      }[m
+[31m--    if flood_wait_seconds is not None:[m
+[31m--        payload["flood_wait_seconds"] = int(flood_wait_seconds)[m
+[31m--    if consecutive_errors is not None:[m
+[31m--        payload["consecutive_errors"] = int(consecutive_errors)[m
+      await _log_event(db, payload)[m
+  [m
+      if bot and await _is_debug_mode(db):[m
+[31m--        if reason == "FloodWait":[m
+[31m--            await _notify([m
+[31m--                bot,[m
+[31m--                "🚨 PROMOTION COOLDOWN\n\n"[m
+[31m--                "Reason: Telegram FloodWait\n"[m
+[31m--                f"Telegram Wait: {int(flood_wait_seconds or 0)} seconds\n"[m
+[31m--                f"Safety Cooldown: {PROMOTION_COOLDOWN_SECONDS} seconds\n\n"[m
+[31m--                "Promotion has been paused.",[m
+[31m--            )[m
+[31m--        else:[m
+[31m--            await _notify([m
+[31m--                bot,[m
+[31m--                "🚨 PROMOTION AUTO-PAUSED\n\n"[m
+[31m--                f"Reason: {reason}\n"[m
+[31m--                f"Consecutive Errors: {int(consecutive_errors or 0)}\n"[m
+[31m--                f"Cooldown: {PROMOTION_COOLDOWN_SECONDS} seconds\n\n"[m
+[31m--                "Promotion has been paused.",[m
+[31m--            )[m
+[32m++        await _notify([m
+[32m++            bot,[m
+[32m++            "⚠️ PROMOTION AUTO-PAUSED (NON-FLOODWAIT)\n\n"[m
+[32m++            f"Category: OTHER SEND ERROR\n"[m
+[32m++            f"Reason: {reason}\n"[m
+[32m++            f"Consecutive Errors: {int(consecutive_errors)}\n"[m
+[32m++            f"Pause Duration: {pause_seconds} seconds\n\n"[m
+[32m++            "Promotion temporarily paused.",[m
+[32m++        )[m
+  [m
+[31m--    if reason == "FloodWait":[m
+[31m--        print([m
+[31m--            f"🚨 FloodWait cooldown activated: {int(flood_wait_seconds or 0)}s wait, "[m
+[31m--            f"{PROMOTION_COOLDOWN_SECONDS}s pause until {cooldown_until.isoformat()}"[m
+[32m++    print([m
+[32m++        f"⚠️ Promotion auto-paused (OTHER SEND ERROR): {reason}, "[m
+[32m++        f"consecutive errors={int(consecutive_errors)}, "[m
+[32m++        f"pause={pause_seconds}s until {cooldown_until.strftime('%H:%M:%S UTC')}"[m
+[32m++    )[m
+[32m++[m
+[32m++[m
+[32m++async def _trigger_cooldown([m
+[32m++    db,[m
+[32m++    reason: str,[m
+[32m++    bot=None,[m
+[32m++    flood_wait_seconds: int | None = None,[m
+[32m++    consecutive_errors: int | None = None,[m
+[32m++):[m
+[32m++    """Routing helper to trigger appropriate cooldown without 30-minute escalation."""[m
+[32m++    if reason == "FloodWait" and flood_wait_seconds is not None:[m
+[32m++        await _trigger_floodwait_cooldown([m
+[32m++            db,[m
+[32m++            flood_wait_seconds=flood_wait_seconds,[m
+[32m++            bot=bot,[m
+          )[m
+      else:[m
+[31m--        print([m
+[31m--            f"🚨 Promotion auto-paused: {reason}, "[m
+[31m--            f"consecutive errors={int(consecutive_errors or 0)}, "[m
+[31m--            f"cooldown until {cooldown_until.isoformat()}"[m
+[32m++        await _trigger_error_pause([m
+[32m++            db,[m
+[32m++            reason=reason,[m
+[32m++            consecutive_errors=consecutive_errors or 0,[m
+[32m++            pause_seconds=60,[m
+[32m++            bot=bot,[m
+          )[m
+  [m
+  [m
+[36m@@@ -350,13 -349,13 +496,22 @@@[m [masync def _loop(bot)[m
+          cycle_start = asyncio.get_event_loop().time()[m
+          db = get_db()[m
+  [m
+[31m--        # FloodWait cooldown is global and must block any new promotion sends[m
+[31m--        # until the pause expires, even after a process restart.[m
+[32m++        # Cooldown check: if FloodWait or temporary error pause is active,[m
+[32m++        # wait the exact remaining time and then clear state to resume normal cycle.[m
+          if await _has_active_cooldown(db):[m
+              remaining = await _get_cooldown_remaining_seconds(db)[m
+[31m--            print(f"⏳ Promotion cooldown active — waiting {remaining:.0f}s before resuming")[m
+[31m--            await asyncio.sleep(min(remaining, 60.0))[m
+[31m--            continue[m
+[32m++            if remaining > 0:[m
+[32m++                cooldown_state = await _get_cooldown_state(db)[m
+[32m++                reason_doc = cooldown_state.get("reason") if cooldown_state else None[m
+[32m++                reason_val = reason_doc.get("value") if isinstance(reason_doc, dict) else str(reason_doc or "cooldown")[m
+[32m++                print(f"⏳ Promotion {reason_val} active — waiting {remaining:.1f}s before resuming normal cycle")[m
+[32m++                while _running and remaining > 0:[m
+[32m++                    await asyncio.sleep(min(remaining, 5.0))[m
+[32m++                    remaining = await _get_cooldown_remaining_seconds(db)[m
+[32m++                if not _running:[m
+[32m++                    break[m
+[32m++            await _clear_cooldown(db)[m
+[32m++            print("✅ Promotion cooldown completed — resuming normal promotion cycle")[m
+  [m
+          messages = await db.messages.find().to_list(100)[m
+          if not messages:[m
+[36m@@@ -375,13 -374,13 +530,11 @@@[m
+          consecutive_error_count = await _get_consecutive_error_count(db)[m
+  [m
+          # ── Rotating message selection ────────────────────────────────────────[m
+[31m--        # Load persisted index, pick one message for this entire cycle, then[m
+[31m--        # advance the pointer so the next cycle uses the following message.[m
+[31m--        idx_doc = await db.state.find_one({"key": "current_message_index"})[m
+[31m--        raw_idx = idx_doc["value"] if idx_doc and "value" in idx_doc else 0[m
+[32m++        # Load persisted index for the current cycle.[m
+[32m++        # It is only advanced when all groups in the cycle have been processed.[m
+[32m++        raw_idx = await _get_current_message_index(db)[m
+          cycle_msg_idx = int(raw_idx) % len(messages)[m
+          current_msg   = messages[cycle_msg_idx][m
+[31m--        print(f"📨 Cycle message: #{cycle_msg_idx + 1}/{len(messages)}")[m
+  [m
+          # ── Blacklist + inactive filter ──────────────────────────────────────[m
+          from handlers.blacklist import get_blacklisted_ids[m
+[36m@@@ -393,35 -392,35 +546,81 @@@[m
+          active_groups = [g for g in groups if g["chat_id"] not in excluded][m
+  [m
+          total_groups = len(active_groups)[m
+[31m--        successful = 0[m
+[31m--        skipped    = 0[m
+[31m--        failed     = 0[m
+[31m--        deactivated = 0[m
+[31m--        cooldown_triggered = False[m
+[32m++        if total_groups == 0:[m
+[32m++            print(f"⚠️  No active groups available — waiting {PROMOTION_INTERVAL_SECONDS}s.")[m
+[32m++            await asyncio.sleep(PROMOTION_INTERVAL_SECONDS)[m
+[32m++            continue[m
+  [m
+[31m--        # ── Cycle-start notification (debug only) ─────────────────────────────[m
+[31m--        now_str = datetime.now(timezone.utc).strftime("%I:%M %p")[m
+[31m--        if debug:[m
+[31m--            cycle_start_text = ([m
+[31m--                "🚀 Promotion Cycle Started\n\n"[m
+[31m--                f"🕒 Time: {now_str} UTC\n"[m
+[31m--                f"📨 Message: #{cycle_msg_idx + 1}/{len(messages)}\n"[m
+[31m--                f"👥 Total Groups: {total_groups}\n\n"[m
+[31m--                "━━━━━━━━━━━━━━"[m
+[32m++        # ── Group Progress Cursor ─────────────────────────────────────────────[m
+[32m++        # Load saved group cursor (if resuming after FloodWait or error pause)[m
+[32m++        cursor_doc = await db.state.find_one({"key": "promotion_group_cursor"})[m
+[32m++        group_cursor = 0[m
+[32m++        if cursor_doc and "value" in cursor_doc:[m
+[32m++            try:[m
+[32m++                group_cursor = int(cursor_doc["value"])[m
+[32m++            except (TypeError, ValueError):[m
+[32m++                group_cursor = 0[m
+[32m++[m
+[32m++        # Safe cursor boundary check to prevent index errors or skipping[m
+[32m++        if group_cursor < 0 or group_cursor >= total_groups:[m
+[32m++            group_cursor = 0[m
+[32m++            await db.state.update_one([m
+[32m++                {"key": "promotion_group_cursor"},[m
+[32m++                {"$set": {"value": 0}},[m
+[32m++                upsert=True,[m
+              )[m
+[31m--            await _notify(bot, cycle_start_text)[m
+  [m
+[31m--        await _log_event(db, {[m
+[31m--            "type": "cycle_start",[m
+[31m--            "message_num": cycle_msg_idx + 1,[m
+[31m--            "total_messages": len(messages),[m
+[31m--            "total_groups": total_groups,[m
+[31m--        })[m
+[32m++        # ── Cycle Stats Accumulator ───────────────────────────────────────────[m
+[32m++        if group_cursor == 0:[m
+[32m++            successful = 0[m
+[32m++            skipped    = 0[m
+[32m++            failed     = 0[m
+[32m++            deactivated = 0[m
+[32m++            await db.state.delete_one({"key": "promotion_cycle_stats"})[m
+[32m++        else:[m
+[32m++            stats_doc = await db.state.find_one({"key": "promotion_cycle_stats"})[m
+[32m++            stats_val = stats_doc.get("value", {}) if stats_doc and isinstance(stats_doc.get("value"), dict) else {}[m
+[32m++            successful = int(stats_val.get("successful", 0))[m
+[32m++            skipped    = int(stats_val.get("skipped", 0))[m
+[32m++            failed     = int(stats_val.get("failed", 0))[m
+[32m++            deactivated = int(stats_val.get("deactivated", 0))[m
+[32m++[m
+[32m++        cooldown_triggered = False[m
+[32m++[m
+[32m++        if group_cursor > 0:[m
+[32m++            print(f"Promotion resuming from group {group_cursor + 1}/{total_groups}")[m
+[32m++            if debug:[m
+[32m++                await _notify([m
+[32m++                    bot,[m
+[32m++                    "🔄 Promotion Resuming\n\n"[m
+[32m++                    f"Resuming from group {group_cursor + 1}/{total_groups}\n"[m
+[32m++                    f"📨 Message: #{cycle_msg_idx + 1}/{len(messages)}"[m
+[32m++                )[m
+[32m++        else:[m
+[32m++            print(f"📨 Cycle message: #{cycle_msg_idx + 1}/{len(messages)} ({total_groups} active groups)")[m
+[32m++            now_str = datetime.now(timezone.utc).strftime("%I:%M %p")[m
+[32m++            if debug:[m
+[32m++                cycle_start_text = ([m
+[32m++                    "🚀 Promotion Cycle Started\n\n"[m
+[32m++                    f"🕒 Time: {now_str} UTC\n"[m
+[32m++                    f"📨 Message: #{cycle_msg_idx + 1}/{len(messages)}\n"[m
+[32m++                    f"👥 Total Groups: {total_groups}\n\n"[m
+[32m++                    "━━━━━━━━━━━━━━"[m
+[32m++                )[m
+[32m++                await _notify(bot, cycle_start_text)[m
+  [m
+[31m--        for i, group in enumerate(active_groups):[m
+[32m++            await _log_event(db, {[m
+[32m++                "type": "cycle_start",[m
+[32m++                "message_num": cycle_msg_idx + 1,[m
+[32m++                "total_messages": len(messages),[m
+[32m++                "total_groups": total_groups,[m
+[32m++            })[m
+[32m++[m
+[32m++        for i in range(group_cursor, total_groups):[m
+              if not _running:[m
+                  break[m
+  [m
+[32m++            group = active_groups[i][m
+              chat_id = group["chat_id"][m
+              group_timer_start = asyncio.get_event_loop().time()[m
+  [m
+[36m@@@ -432,6 -431,6 +631,8 @@@[m
+              except Exception:[m
+                  name = str(chat_id)[m
+  [m
+[32m++            print(f"Promotion: sending group {i + 1}/{total_groups} ({name})")[m
+[32m++[m
+              # "ok" | "skipped" | "failed" | "inactive"[m
+              group_result = "ok"[m
+              error_detail = ""[m
+[36m@@@ -441,18 -440,18 +642,47 @@@[m
+                  await _inc_stat(db, "total_sent")[m
+  [m
+              except FloodWait as e:[m
+[31m--                # FloodWait is not ignored: Telegram imposes the wait and the bot[m
+[31m--                # must stop the current cycle and enter a global cooldown.[m
+[32m++                # REAL TELEGRAM FLOODWAIT:[m
+[32m++                # Telegram has returned an authentic FloodWait error with duration in e.value.[m
+                  wait_seconds = int(getattr(e, "value", 0) or 0)[m
+[31m--                error_detail = f"FloodWait {wait_seconds} seconds"[m
+[31m--                print(f"  ⚠️  FloodWait {wait_seconds}s — pausing promotion for cooldown")[m
+[32m++                safety_buffer = FLOODWAIT_SAFETY_BUFFER_SECONDS[m
+[32m++                total_wait = wait_seconds + safety_buffer[m
+[32m++                error_detail = f"REAL TELEGRAM FLOODWAIT: {wait_seconds}s (wait: {total_wait}s)"[m
+[32m++                [m
+[32m++                print(f"FloodWait received: {wait_seconds} seconds")[m
+[32m++                print(f"Promotion paused at group {i + 1}/{total_groups}")[m
+[32m++                [m
+                  await _inc_stat(db, "total_failed")[m
+                  group_result = "failed"[m
+[31m--                await _trigger_cooldown([m
+[32m++                failed += 1[m
+[32m++[m
+[32m++                # Set next cursor position to the NEXT group (i + 1)[m
+[32m++                # This ensures we do NOT retry the failed group immediately, and do NOT restart from group 1.[m
+[32m++                next_cursor = i + 1[m
+[32m++                await db.state.update_one([m
+[32m++                    {"key": "promotion_group_cursor"},[m
+[32m++                    {"$set": {"value": next_cursor}},[m
+[32m++                    upsert=True,[m
+[32m++                )[m
+[32m++                await db.state.update_one([m
+[32m++                    {"key": "promotion_cycle_stats"},[m
+[32m++                    {"$set": {"value": {[m
+[32m++                        "successful": successful,[m
+[32m++                        "failed": failed,[m
+[32m++                        "skipped": skipped,[m
+[32m++                        "deactivated": deactivated,[m
+[32m++                    }}},[m
+[32m++                    upsert=True,[m
+[32m++                )[m
+[32m++[m
+[32m++                await _trigger_floodwait_cooldown([m
+                      db,[m
+[31m--                    reason="FloodWait",[m
+[31m--                    bot=bot,[m
+                      flood_wait_seconds=wait_seconds,[m
+[32m++                    safety_buffer_seconds=safety_buffer,[m
+[32m++                    bot=bot,[m
+[32m++                    chat_id=chat_id,[m
+[32m++                    group_index=i + 1,[m
+[32m++                    total_groups=total_groups,[m
+                  )[m
+                  cooldown_triggered = True[m
+                  break[m
+[36m@@@ -461,18 -460,18 +691,38 @@@[m
+                  # Temporary — count it toward the consecutive-error safety check,[m
+                  # but do not deactivate the group or retry it in the same cycle.[m
+                  wait_time = getattr(e, "value", 30)[m
+[31m--                error_detail = f"Slowmode {wait_time} seconds"[m
+[31m--                print(f"  ⚠️  SlowmodeWait {wait_time}s — counting as temporary failure")[m
+[32m++                error_detail = f"SlowmodeWait {wait_time} seconds"[m
+[32m++                print(f"  ⚠️  SlowmodeWait {wait_time}s on {name} — counting as temporary failure")[m
+                  await _inc_stat(db, "total_failed")[m
+                  group_result = "failed"[m
+[32m++                failed += 1[m
+                  consecutive_error_count += 1[m
+                  await _set_consecutive_error_count(db, consecutive_error_count)[m
+                  if consecutive_error_count >= PROMOTION_MAX_CONSECUTIVE_ERRORS:[m
+[31m--                    await _trigger_cooldown([m
+[32m++                    next_cursor = i + 1[m
+[32m++                    await db.state.update_one([m
+[32m++                        {"key": "promotion_group_cursor"},[m
+[32m++                        {"$set": {"value": next_cursor}},[m
+[32m++                        upsert=True,[m
+[32m++                    )[m
+[32m++                    await db.state.update_one([m
+[32m++                        {"key": "promotion_cycle_stats"},[m
+[32m++                        {"$set": {"value": {[m
+[32m++                            "successful": successful,[m
+[32m++                            "failed": failed,[m
+[32m++                            "skipped": skipped,[m
+[32m++                            "deactivated": deactivated,[m
+[32m++                        }}},[m
+[32m++                        upsert=True,[m
+[32m++                    )[m
+[32m++                    await _trigger_error_pause([m
+                          db,[m
+[31m--                        reason="Repeated temporary promotion errors",[m
+[31m--                        bot=bot,[m
+[32m++                        reason="Repeated temporary promotion errors (SlowmodeWait)",[m
+                          consecutive_errors=consecutive_error_count,[m
+[32m++                        pause_seconds=60,[m
+[32m++                        bot=bot,[m
+[32m++                        group_index=i + 1,[m
+[32m++                        total_groups=total_groups,[m
+                      )[m
+                      cooldown_triggered = True[m
+                      break[m
+[36m@@@ -484,6 -483,6 +734,7 @@@[m
+                  await _inc_stat(db, "total_failed")[m
+                  await mark_inactive(chat_id, error_detail)[m
+                  group_result = "inactive"[m
+[32m++                deactivated += 1[m
+  [m
+              except ValueError as e:[m
+                  # pyrogram/utils.py:get_peer_type() raises a plain ValueError[m
+[36m@@@ -495,19 -494,19 +746,40 @@@[m
+                      await _inc_stat(db, "total_failed")[m
+                      await mark_inactive(chat_id, f"PeerIdInvalid(ValueError): {e}")[m
+                      group_result = "inactive"[m
+[32m++                    deactivated += 1[m
+                  else:[m
+                      error_detail = f"ValueError: {e}"[m
+                      print(f"  ⚠️  ValueError on {name}: {e} — counting as temporary failure")[m
+                      await _inc_stat(db, "total_failed")[m
+                      group_result = "failed"[m
+[32m++                    failed += 1[m
+                      consecutive_error_count += 1[m
+                      await _set_consecutive_error_count(db, consecutive_error_count)[m
+                      if consecutive_error_count >= PROMOTION_MAX_CONSECUTIVE_ERRORS:[m
+[31m--                        await _trigger_cooldown([m
+[32m++                        next_cursor = i + 1[m
+[32m++                        await db.state.update_one([m
+[32m++                            {"key": "promotion_group_cursor"},[m
+[32m++                            {"$set": {"value": next_cursor}},[m
+[32m++                            upsert=True,[m
+[32m++                        )[m
+[32m++                        await db.state.update_one([m
+[32m++                            {"key": "promotion_cycle_stats"},[m
+[32m++                            {"$set": {"value": {[m
+[32m++                                "successful": successful,[m
+[32m++                                "failed": failed,[m
+[32m++                                "skipped": skipped,[m
+[32m++                                "deactivated": deactivated,[m
+[32m++                            }}},[m
+[32m++                            upsert=True,[m
+[32m++                        )[m
+[32m++                        await _trigger_error_pause([m
+                              db,[m
+[31m--                            reason="Repeated temporary promotion errors",[m
+[31m--                            bot=bot,[m
+[32m++                            reason="Repeated temporary promotion errors (ValueError)",[m
+                              consecutive_errors=consecutive_error_count,[m
+[32m++                            pause_seconds=60,[m
+[32m++                            bot=bot,[m
+[32m++                            group_index=i + 1,[m
+[32m++                            total_groups=total_groups,[m
+                          )[m
+                          cooldown_triggered = True[m
+                          break[m
+[36m@@@ -518,14 -517,14 +790,34 @@@[m
+                  print(f"  ⚠️  Temporary error on {name}: {e} — counting as temporary failure")[m
+                  await _inc_stat(db, "total_failed")[m
+                  group_result = "failed"[m
+[32m++                failed += 1[m
+                  consecutive_error_count += 1[m
+                  await _set_consecutive_error_count(db, consecutive_error_count)[m
+                  if consecutive_error_count >= PROMOTION_MAX_CONSECUTIVE_ERRORS:[m
+[31m--                    await _trigger_cooldown([m
+[32m++                    next_cursor = i + 1[m
+[32m++                    await db.state.update_one([m
+[32m++                        {"key": "promotion_group_cursor"},[m
+[32m++                        {"$set": {"value": next_cursor}},[m
+[32m++                        upsert=True,[m
+[32m++                    )[m
+[32m++                    await db.state.update_one([m
+[32m++                        {"key": "promotion_cycle_stats"},[m
+[32m++                        {"$set": {"value": {[m
+[32m++                            "successful": successful,[m
+[32m++                            "failed": failed,[m
+[32m++                            "skipped": skipped,[m
+[32m++                            "deactivated": deactivated,[m
+[32m++                        }}},[m
+[32m++                        upsert=True,[m
+[32m++                    )[m
+[32m++                    await _trigger_error_pause([m
+                          db,[m
+                          reason="Repeated temporary promotion errors",[m
+[31m--                        bot=bot,[m
+                          consecutive_errors=consecutive_error_count,[m
+[32m++                        pause_seconds=60,[m
+[32m++                        bot=bot,[m
+[32m++                        group_index=i + 1,[m
+[32m++                        total_groups=total_groups,[m
+                      )[m
+                      cooldown_triggered = True[m
+                      break[m
+[36m@@@ -546,11 -545,11 +838,27 @@@[m
+              elif group_result == "inactive":[m
+                  status_emoji = "🚫 Deactivated"[m
+                  label        = "Deactivated (permanent error)"[m
+[31m--                deactivated += 1[m
+              else:[m
+                  status_emoji = "❌ Failed"[m
+                  label        = "Failed (temporary)"[m
+[31m--                failed      += 1[m
+[32m++[m
+[32m++            # Advance cursor and save cycle progress in state[m
+[32m++            next_cursor = i + 1[m
+[32m++            await db.state.update_one([m
+[32m++                {"key": "promotion_group_cursor"},[m
+[32m++                {"$set": {"value": next_cursor}},[m
+[32m++                upsert=True,[m
+[32m++            )[m
+[32m++            await db.state.update_one([m
+[32m++                {"key": "promotion_cycle_stats"},[m
+[32m++                {"$set": {"value": {[m
+[32m++                    "successful": successful,[m
+[32m++                    "failed": failed,[m
+[32m++                    "skipped": skipped,[m
+[32m++                    "deactivated": deactivated,[m
+[32m++                }}},[m
+[32m++                upsert=True,[m
+[32m++            )[m
+  [m
+              remaining_groups = total_groups - (i + 1)[m
+              print(f"[{i + 1}/{total_groups}] {name} -> {label}")[m
+[36m@@@ -589,7 -588,7 +897,7 @@@[m
+              # Conservative inter-group rate limit for promotions only.[m
+              # This delay is intentionally placed only between actual promotion[m
+              # sends, not between owner/debug notifications. It does not affect[m
+[31m--            # the 5-minute cycle cadence logic at the end of the cycle.[m
+[32m++            # the 10-minute cycle cadence logic at the end of the cycle.[m
+              if _running and i < total_groups - 1:[m
+                  wait_seconds = random.uniform([m
+                      PROMOTION_MIN_DELAY_SECONDS,[m
+[36m@@@ -601,10 -600,10 +909,21 @@@[m
+                  await asyncio.sleep(wait_seconds)[m
+  [m
+          if cooldown_triggered:[m
+[31m--            print("⏳ FloodWait cooldown active — current cycle stopped before remaining groups")[m
+[32m++            print("⏳ Cooldown triggered — current cycle stopped safely before remaining groups")[m
+              continue[m
+  [m
+[32m++        if not _running:[m
+[32m++            break[m
+[32m++[m
+          # ── End-of-cycle summary ─────────────────────────────────────────────[m
+[32m++        # All groups in this cycle completed! Reset group cursor and cycle stats for the next cycle.[m
+[32m++        await db.state.update_one([m
+[32m++            {"key": "promotion_group_cursor"},[m
+[32m++            {"$set": {"value": 0}},[m
+[32m++            upsert=True,[m
+[32m++        )[m
+[32m++        await db.state.delete_one({"key": "promotion_cycle_stats"})[m
+[32m++[m
+          await _set_stat(db, "last_promotion_time",[m
+                          datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))[m
+  [m
+[36m@@@ -647,17 -646,13 +966,13 @@@[m
+              break[m
+  [m
+          # Advance the rotating index and persist it for the next cycle /[m
+[31m--        # restart.  Wraps via modulo when fetched at the top of the next cycle.[m
+[32m++        # restart. Wraps via modulo when fetched at the top of the next cycle.[m
+          next_idx = (cycle_msg_idx + 1) % len(messages)[m
+[31m--        await _set_stat(db, "current_message_index", next_idx)[m
+[32m++        await _set_current_message_index(db, next_idx)[m
+  [m
+[31m-         # ── Vary cycle cadence while subtracting time already spent ──────────[m
+[31m -        # ── Exact 5-minute cadence: subtract time already spent ──────────────[m
+[32m++        # ── Exact 10-minute cadence: subtract time already spent ─────────────[m
+          elapsed   = asyncio.get_event_loop().time() - cycle_start[m
+[31m-         next_interval = random.uniform([m
+[31m-             PROMOTION_INTERVAL_SECONDS - PROMOTION_INTERVAL_VARIATION_SECONDS,[m
+[31m-             PROMOTION_INTERVAL_SECONDS + PROMOTION_INTERVAL_VARIATION_SECONDS,[m
+[31m-         )[m
+[31m-         remaining = max(0.0, next_interval - elapsed)[m
+[31m -        remaining = max(0.0, 300.0 - elapsed)[m
+[32m++        remaining = max(0.0, float(PROMOTION_INTERVAL_SECONDS) - elapsed)[m
+  [m
+          next_cycle_min = int(remaining // 60)[m
+          next_cycle_sec = int(remaining % 60)[m
+[36m@@@ -720,6 -715,6 +1035,7 @@@[m
+              print(f"⏳ Next cycle in {remaining:.0f}s.")[m
+              await asyncio.sleep(remaining)[m
+  [m
+[32m++    _running = False[m
+      print("🔴 Promotion Stopped")[m
+  [m
+  [m
+[36m@@@ -727,7 -722,7 +1043,7 @@@[m
+  [m
+  async def start_promotion(bot):[m
+      global _running, _task[m
+[31m--    if _running:[m
+[32m++    if _running and _task is not None and not _task.done():[m
+          return[m
+      _running = True[m
+      db = get_db()[m
+[36m@@@ -748,6 -743,6 +1064,14 @@@[m [masync def stop_promotion()[m
+          {"$set": {"value": False}},[m
+          upsert=True,[m
+      )[m
+[32m++    await db.state.delete_many({[m
+[32m++        "key": {[m
+[32m++            "$in": [[m
+[32m++                "promotion_group_cursor",[m
+[32m++                "promotion_cycle_stats",[m
+[32m++            ][m
+[32m++        }[m
+[32m++    })[m
+      if _task and not _task.done():[m
+          _task.cancel()[m
+          try:[m
+[36m@@@ -758,7 -753,7 +1082,8 @@@[m
+  [m
+  [m
+  def is_running() -> bool:[m
+[31m--    return _running[m
+[32m++    global _running, _task[m
+[32m++    return bool(_running and _task is not None and not _task.done())[m
+  [m
+  [m
+  async def restore_state(bot):[m
