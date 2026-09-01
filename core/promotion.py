@@ -36,6 +36,8 @@ from config import (
     PROMOTION_MAX_FAILURE_RATE,
     PROMOTION_MIN_GROUPS_FOR_FAILURE_RATE,
     OWNER_ID,
+    PROMOTION_MAX_CONTINUOUS_RUNTIME_SECONDS,
+    PROMOTION_REST_DURATION_SECONDS,
     PROMOTION_LONG_FLOODWAIT_THRESHOLD_SECONDS,
     EXTRA_LONG_FLOODWAIT_BUFFER_SECONDS,
 )
@@ -500,28 +502,114 @@ async def _clear_long_floodwait_pause(db):
     await db.state.delete_one({"key": "promotion_long_floodwait_resume_until"})
 
 
+async def _get_continuous_runtime_seconds(db) -> float:
+    accumulated_doc = await db.state.find_one({"key": "promotion_continuous_runtime_seconds"})
+    active_since_doc = await db.state.find_one({"key": "promotion_continuous_runtime_active_since"})
+    try:
+        accumulated = float((accumulated_doc or {}).get("value", 0))
+    except (TypeError, ValueError):
+        accumulated = 0.0
+    active_since = _normalize_datetime((active_since_doc or {}).get("value"))
+    if active_since:
+        accumulated += max(0.0, (datetime.now(timezone.utc) - active_since).total_seconds())
+    return accumulated
+
+
+async def _start_continuous_runtime(db):
+    now = datetime.now(timezone.utc)
+    await db.state.update_one(
+        {"key": "promotion_continuous_runtime_active_since"},
+        {"$set": {"value": now, "updated_at": now}},
+        upsert=True,
+    )
+
+
+async def _pause_continuous_runtime(db):
+    runtime = await _get_continuous_runtime_seconds(db)
+    now = datetime.now(timezone.utc)
+    await db.state.update_one(
+        {"key": "promotion_continuous_runtime_seconds"},
+        {"$set": {"value": runtime, "updated_at": now}},
+        upsert=True,
+    )
+    await db.state.delete_one({"key": "promotion_continuous_runtime_active_since"})
+
+
+async def _reset_continuous_runtime(db):
+    await db.state.delete_many({
+        "key": {
+            "$in": [
+                "promotion_continuous_runtime_seconds",
+                "promotion_continuous_runtime_active_since",
+            ]
+        }
+    })
+
+
+async def _get_promotion_rest_until(db):
+    doc = await db.state.find_one({"key": "promotion_rest_until"})
+    return _normalize_datetime((doc or {}).get("value"))
+
+
+async def _clear_promotion_rest(db):
+    await db.state.delete_one({"key": "promotion_rest_until"})
+
+
 # ── Promotion loop ────────────────────────────────────────────────────────────
 
 async def _loop(bot):
     global _running
 
     print("✅ Promotion Started")
+    db = get_db()
+    await _start_continuous_runtime(db)
 
     while _running:
         cycle_start = asyncio.get_event_loop().time()
         db = get_db()
+
+        rest_expired = False
+        rest_until = await _get_promotion_rest_until(db)
+        if rest_until:
+            remaining = (rest_until - datetime.now(timezone.utc)).total_seconds()
+            if remaining > 0:
+                print(f"Promotion rest started until: {rest_until.isoformat()}")
+                await _pause_continuous_runtime(db)
+                while _running and remaining > 0:
+                    await asyncio.sleep(remaining)
+                    remaining = (rest_until - datetime.now(timezone.utc)).total_seconds()
+                if not _running:
+                    break
+            await _clear_promotion_rest(db)
+            await _reset_continuous_runtime(db)
+            rest_expired = True
+            print("Promotion rest expired — automatically resuming")
+
+        if await _get_continuous_runtime_seconds(db) >= PROMOTION_MAX_CONTINUOUS_RUNTIME_SECONDS:
+            rest_until = datetime.now(timezone.utc) + timedelta(seconds=PROMOTION_REST_DURATION_SECONDS)
+            print("Promotion continuous runtime limit reached — taking a 1 hour rest")
+            await db.state.update_one(
+                {"key": "promotion_rest_until"},
+                {"$set": {"value": rest_until, "updated_at": datetime.now(timezone.utc)}},
+                upsert=True,
+            )
+            print(f"Promotion rest started until: {rest_until.isoformat()}")
+            await _pause_continuous_runtime(db)
+            continue
 
         long_floodwait_expired = False
         long_floodwait_until = await _get_long_floodwait_resume_until(db)
         if long_floodwait_until:
             remaining = (long_floodwait_until - datetime.now(timezone.utc)).total_seconds()
             if remaining > 0:
+                await _pause_continuous_runtime(db)
                 print(f"⏳ Long FloodWait active — waiting {remaining:.1f}s before resuming")
                 while _running and remaining > 0:
                     await asyncio.sleep(min(remaining, 5.0))
                     remaining = (long_floodwait_until - datetime.now(timezone.utc)).total_seconds()
                 if not _running:
                     break
+                await _start_continuous_runtime(db)
             await _clear_long_floodwait_pause(db)
             long_floodwait_expired = True
 
@@ -530,6 +618,7 @@ async def _loop(bot):
         if await _has_active_cooldown(db):
             remaining = await _get_cooldown_remaining_seconds(db)
             if remaining > 0:
+                await _pause_continuous_runtime(db)
                 cooldown_state = await _get_cooldown_state(db)
                 reason_doc = cooldown_state.get("reason") if cooldown_state else None
                 reason_val = reason_doc.get("value") if isinstance(reason_doc, dict) else str(reason_doc or "cooldown")
@@ -539,6 +628,7 @@ async def _loop(bot):
                     remaining = await _get_cooldown_remaining_seconds(db)
                 if not _running:
                     break
+                await _start_continuous_runtime(db)
             await _clear_cooldown(db)
             print("✅ Promotion cooldown completed — resuming normal promotion cycle")
 
@@ -601,6 +691,9 @@ async def _loop(bot):
 
         if long_floodwait_expired:
             print(f"FloodWait expired — resuming from group {group_cursor + 1}/{total_groups}")
+
+        if rest_expired:
+            print(f"Promotion resuming from group {group_cursor + 1}/{total_groups}")
 
         # ── Cycle Stats Accumulator ───────────────────────────────────────────
         if group_cursor == 0:
@@ -1122,6 +1215,9 @@ async def stop_promotion():
             "$in": [
                 "promotion_group_cursor",
                 "promotion_cycle_stats",
+                "promotion_continuous_runtime_seconds",
+                "promotion_continuous_runtime_active_since",
+                "promotion_rest_until",
             ]
         }
     })
