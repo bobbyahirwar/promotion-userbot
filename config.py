@@ -36,6 +36,10 @@ PROMOTION_INTERVAL_VARIATION_SECONDS = int(
     os.getenv("PROMOTION_INTERVAL_VARIATION_SECONDS", 60)
 )
 
+PROMOTION_DECORATIVE_VARIATION = os.getenv(
+    "PROMOTION_DECORATIVE_VARIATION", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 # Promotion safety settings use built-in defaults so Render does not need any
 # new environment variables for these protections. Keep the existing required
 # app env vars unchanged.
