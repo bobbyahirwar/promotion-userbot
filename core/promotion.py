@@ -29,6 +29,7 @@ _PERMANENT_ERRORS = (
 from config import (
     PROMOTION_INTERVAL_SECONDS,
     PROMOTION_INTERVAL_VARIATION_SECONDS,
+    PROMOTION_DECORATIVE_VARIATION,
     PROMOTION_MIN_DELAY_SECONDS,
     PROMOTION_MAX_DELAY_SECONDS,
     PROMOTION_COOLDOWN_SECONDS,
@@ -47,7 +48,23 @@ from core.userbot import userbot
 _task: asyncio.Task = None
 _running: bool = False
 
+_DECORATIVE_SYMBOLS = tuple("™®©=∆×÷π•|`~¥^°{}%✓<>*\"':;!?/)(+-&_#@")
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _decorate_text(text: str, used_variations: set | None = None) -> str:
+    """Return text with a random 1-3 symbol prefix and suffix."""
+    for _ in range(10):
+        prefix = "".join(random.choices(_DECORATIVE_SYMBOLS, k=random.randint(1, 3)))
+        suffix = "".join(random.choices(_DECORATIVE_SYMBOLS, k=random.randint(1, 3)))
+        combination = (prefix, suffix)
+        if used_variations is None or combination not in used_variations:
+            if used_variations is not None:
+                used_variations.add(combination)
+            break
+    return f"{prefix} {text} {suffix}"
+
 
 async def _download(bot, file_id: str) -> io.BytesIO:
     """Download a Bot-API file into memory and return a seeked BytesIO buffer."""
@@ -58,17 +75,37 @@ async def _download(bot, file_id: str) -> io.BytesIO:
     return buf
 
 
-async def _send_one(bot, chat_id: int, msg: dict):
+async def _send_one(
+    bot,
+    chat_id: int,
+    msg: dict,
+    used_variations: set | None = None,
+):
     """Send a single stored message to chat_id via the userbot."""
     caption = msg.get("caption") or None
     if msg["type"] == "text":
-        await userbot.send_message(chat_id, msg["text"])
+        if PROMOTION_DECORATIVE_VARIATION:
+            await userbot.send_message(
+                chat_id,
+                _decorate_text(msg["text"], used_variations),
+                parse_mode=None,
+            )
+        else:
+            await userbot.send_message(chat_id, msg["text"])
     elif msg["type"] == "photo":
         buf = await _download(bot, msg["file_id"])
-        await userbot.send_photo(chat_id, buf, caption=caption)
+        if PROMOTION_DECORATIVE_VARIATION and caption:
+            caption = _decorate_text(caption, used_variations)
+            await userbot.send_photo(chat_id, buf, caption=caption, parse_mode=None)
+        else:
+            await userbot.send_photo(chat_id, buf, caption=caption)
     elif msg["type"] == "video":
         buf = await _download(bot, msg["file_id"])
-        await userbot.send_video(chat_id, buf, caption=caption)
+        if PROMOTION_DECORATIVE_VARIATION and caption:
+            caption = _decorate_text(caption, used_variations)
+            await userbot.send_video(chat_id, buf, caption=caption, parse_mode=None)
+        else:
+            await userbot.send_video(chat_id, buf, caption=caption)
 
 
 async def _inc_stat(db, key: str, amount: int = 1):
@@ -711,6 +748,7 @@ async def _loop(bot):
             deactivated = int(stats_val.get("deactivated", 0))
 
         cooldown_triggered = False
+        used_variations = set()
 
         if group_cursor > 0:
             print(f"Promotion resuming from group {group_cursor + 1}/{total_groups}")
@@ -763,7 +801,7 @@ async def _loop(bot):
             error_detail = ""
 
             try:
-                await _send_one(bot, chat_id, current_msg)
+                await _send_one(bot, chat_id, current_msg, used_variations)
                 await _inc_stat(db, "total_sent")
 
             except FloodWait as e:
