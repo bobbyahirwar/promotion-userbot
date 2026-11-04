@@ -459,28 +459,19 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stopped["status"], "stopped")
             self.assertTrue(await autorotate.delete_config(str(second["_id"])))
 
-    async def test_group_rotation_rejects_fast_intervals_but_private_test_allows_them(self):
-        config = await self._new_valid_config(interval=30)
-        error = await autorotate._validate_for_start(config, test_mode=False)
-        self.assertIn("60–86400 seconds", error)
-        self.assertIn("10, 20, and 30 seconds", error)
-        for interval in (10, 20, 30, 47, 86400):
+    async def test_group_and_private_interval_validation_uses_same_allowed_range(self):
+        config = await self._new_valid_config(interval=5)
+        for interval in (5, 10, 20, 30, 60, 120, 300, 47, 86400):
             config["interval_seconds"] = interval
-            self.assertIsNone(
-                await autorotate._validate_for_start(config, test_mode=True),
-                f"{interval} seconds should be accepted for private tests",
-            )
-        for interval in (9, 86401):
+            self.assertIsNone(await autorotate._validate_for_start(config, test_mode=True))
+            self.assertIsNone(await autorotate._validate_for_start(config, test_mode=False))
+        for interval in (0, 1, 4, 6, 9):
             config["interval_seconds"] = interval
-            self.assertIn(
-                "10–86400 seconds",
-                await autorotate._validate_for_start(config, test_mode=True),
-            )
-
-        config["interval_seconds"] = 59
-        self.assertIn("60–86400 seconds", await autorotate._validate_for_start(config, test_mode=False))
-        config["interval_seconds"] = 60
-        self.assertIsNone(await autorotate._validate_for_start(config, test_mode=False))
+            for test_mode in (True, False):
+                error = await autorotate._validate_for_start(config, test_mode=test_mode)
+                self.assertIn("Intervals below 10 seconds are unavailable", error)
+        config["interval_seconds"] = 86401
+        self.assertIn("cannot exceed 86400", await autorotate._validate_for_start(config, test_mode=False))
 
     async def test_custom_interval_persists_and_scheduler_recovery_uses_it_once(self):
         config = await self._new_valid_config(interval=300)

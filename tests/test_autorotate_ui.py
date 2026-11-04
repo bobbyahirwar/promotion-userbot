@@ -269,6 +269,63 @@ class InlineAutoRotateTests(unittest.IsolatedAsyncioTestCase):
             await ui.callback_autorotate(update, SimpleNamespace())
         edit.assert_awaited_once_with("config-id", {"interval_seconds": 20})
 
+    async def test_five_second_interval_preset_is_saved_and_shown_in_summary(self):
+        ui._ui_drafts[1] = {
+            "mode": "edit_interval",
+            "config_id": "config-id",
+            "interval_seconds": 300,
+        }
+        query = SimpleNamespace(
+            id="interval-five",
+            data="ar:is:5",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            from_user=SimpleNamespace(id=1),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=1),
+        )
+        with (
+            patch.object(ui.autorotate, "edit_config", new=AsyncMock(return_value=True)) as edit,
+            patch.object(ui, "_show_configuration", new=AsyncMock()),
+        ):
+            await ui.callback_autorotate(update, SimpleNamespace())
+        edit.assert_awaited_once_with("config-id", {"interval_seconds": 5})
+        self.assertEqual(ui._interval_label(5), "5 seconds")
+
+    async def test_creation_summary_formats_the_selected_interval(self):
+        draft = {
+            "name": "Rotation",
+            "config_id": "config-id",
+            "group_ids": [101],
+            "message_ids": ["message-id"],
+            "interval_seconds": 5,
+        }
+        query = SimpleNamespace(edit_message_text=AsyncMock())
+        with patch.object(ui, "_save_new_config", new=AsyncMock()):
+            await ui._show_creation_summary(query, draft)
+        self.assertIn("Interval: 5 seconds", query.edit_message_text.await_args.kwargs["text"])
+
+    async def test_custom_interval_below_ten_is_rejected_with_preset_guidance(self):
+        ui._ui_drafts[1] = {
+            "mode": "edit_interval",
+            "config_id": "config-id",
+            "interval_seconds": 300,
+        }
+        ui._custom_interval_inputs[1] = {"chat_id": 1, "message_id": 55}
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            effective_message=SimpleNamespace(text="5", chat_id=1),
+        )
+        bot = SimpleNamespace(edit_message_text=AsyncMock())
+        with patch.object(ui.autorotate, "edit_config", new=AsyncMock()) as edit:
+            await ui._handle_custom_interval(update, SimpleNamespace(bot=bot))
+        edit.assert_not_awaited()
+        error = bot.edit_message_text.await_args.kwargs["text"]
+        self.assertIn("Custom intervals must be between 10", error)
+        self.assertIn("choose the 5-second preset", error)
+
     async def test_custom_interval_input_is_saved_as_seconds(self):
         ui._ui_drafts[1] = {
             "mode": "edit_interval",

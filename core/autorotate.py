@@ -13,18 +13,28 @@ from database import get_db
 
 log = logging.getLogger(__name__)
 
-MIN_GROUP_INTERVAL_SECONDS = 60
+MIN_GROUP_INTERVAL_SECONDS = 5
 MIN_GROUP_SEND_GAP_SECONDS = 60
-MIN_PRIVATE_TEST_INTERVAL_SECONDS = 10
+MIN_CUSTOM_INTERVAL_SECONDS = 10
 MAX_INTERVAL_SECONDS = 86400
 FLOODWAIT_BUFFER_SECONDS = 5
 INTERVAL_PRESETS = {
+    "5": 5,
     "10": 10,
     "20": 20,
     "30": 30,
     "1m": 60,
     "2m": 120,
     "5m": 300,
+}
+INTERVAL_PRESET_LABELS = {
+    5: "5 seconds",
+    10: "10 seconds",
+    20: "20 seconds",
+    30: "30 seconds",
+    60: "1 minute",
+    120: "2 minutes",
+    300: "5 minutes",
 }
 
 _jobs: dict[str, asyncio.Task] = {}
@@ -69,6 +79,14 @@ def _config_key(config_id) -> str:
 
 def _collection():
     return get_db().autorotate_configs
+
+
+def interval_validation_error(seconds: int) -> str | None:
+    if seconds == MIN_GROUP_INTERVAL_SECONDS or MIN_CUSTOM_INTERVAL_SECONDS <= seconds <= MAX_INTERVAL_SECONDS:
+        return None
+    if seconds < MIN_CUSTOM_INTERVAL_SECONDS:
+        return "Intervals below 10 seconds are unavailable; choose the 5-second preset or use at least 10 seconds."
+    return f"Intervals cannot exceed {MAX_INTERVAL_SECONDS} seconds."
 
 
 async def create_config(name: str) -> dict:
@@ -499,19 +517,13 @@ async def _validate_for_start(config: dict, test_mode: bool) -> str | None:
     except ValueError as exc:
         return str(exc)
     interval = int(config.get("interval_seconds", 0))
+    interval_error = interval_validation_error(interval)
+    if interval_error:
+        if test_mode:
+            return f"Private test interval is invalid. {interval_error}"
+        return f"Group posting requires at least 5 seconds. {interval_error}"
     if test_mode:
-        if not MIN_PRIVATE_TEST_INTERVAL_SECONDS <= interval <= MAX_INTERVAL_SECONDS:
-            return (
-                "Private test intervals must be 10–86400 seconds "
-                "(10, 20, 30 seconds or any custom interval in that range)."
-            )
         return None
-    if not MIN_GROUP_INTERVAL_SECONDS <= interval <= MAX_INTERVAL_SECONDS:
-        return (
-            "Group posting intervals must be 60–86400 seconds "
-            "(1 minute, 2 minutes, 5 minutes, or a custom interval); "
-            "10, 20, and 30 seconds are available only with /autorotate test."
-        )
     group_ids = config.get("group_ids", [])
     if not group_ids:
         return "Select at least one authorized group before starting."
