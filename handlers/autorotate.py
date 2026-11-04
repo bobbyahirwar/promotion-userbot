@@ -146,9 +146,9 @@ async def _show_help(query) -> None:
         "Auto Message Rotation\n\n"
         "Create a configuration, select only groups you explicitly authorize, "
         "choose saved messages and set an interval. Review the summary before saving.\n\n"
-        "Intervals are 5, 10, 20, 30, 60, 120, or 300 seconds, or custom intervals "
-        "from 10 to 86400 seconds. Group posting requires at least 5 seconds and "
-        "sends at least 60 seconds apart globally. Values 6–9 seconds are unavailable.\n"
+        "The default interval is 10 seconds. You can choose a preset or a custom interval "
+        "from 10 to 86400 seconds. Group posting requires at least 5 seconds; values "
+        "6–9 seconds are unavailable.\n"
         "FloodWait pauses rotation; the bot will not retry before Telegram's cooldown expires.",
         _keyboard([[_button("⬅️ Main Menu", "home")]]),
     )
@@ -354,7 +354,7 @@ async def _configuration_text(config: dict) -> str:
     return (
         f"{config.get('name', 'AutoRotate')}\n"
         f"ID: {config['_id']}\n"
-        f"Interval: {_interval_label(int(config.get('interval_seconds', 300)))}\n"
+        f"Interval: {_interval_label(int(config.get('interval_seconds', 10)))}\n"
         f"Status: {config.get('status', 'stopped')}"
         + (" (private test)" if config.get("test_mode") and config.get("status") == "running" else "")
         + f"\n\nGroups ({len(group_ids)}):\n"
@@ -415,7 +415,7 @@ async def _begin_group_edit(query, user_id: int, config: dict, mode: str) -> Non
         "config_id": str(config["_id"]),
         "group_ids": list(config.get("group_ids", [])),
         "message_ids": list(config.get("message_ids", [])),
-        "interval_seconds": int(config.get("interval_seconds", 300)),
+        "interval_seconds": int(config.get("interval_seconds", 10)),
         "name": config.get("name", "Rotation"),
     }
     await _show_group_picker(query, user_id)
@@ -427,7 +427,7 @@ async def _begin_message_edit(query, user_id: int, config: dict) -> None:
         "config_id": str(config["_id"]),
         "group_ids": list(config.get("group_ids", [])),
         "message_ids": list(config.get("message_ids", [])),
-        "interval_seconds": int(config.get("interval_seconds", 300)),
+        "interval_seconds": int(config.get("interval_seconds", 10)),
         "name": config.get("name", "Rotation"),
     }
     await _show_message_picker(query, user_id)
@@ -439,7 +439,7 @@ async def _begin_interval_edit(query, user_id: int, config: dict) -> None:
         "config_id": str(config["_id"]),
         "group_ids": list(config.get("group_ids", [])),
         "message_ids": list(config.get("message_ids", [])),
-        "interval_seconds": int(config.get("interval_seconds", 300)),
+        "interval_seconds": int(config.get("interval_seconds", 10)),
         "name": config.get("name", "Rotation"),
     }
     await _show_interval_picker(query, user_id)
@@ -661,7 +661,7 @@ async def _dispatch_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
             "name": f"Rotation {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}",
             "group_ids": [],
             "message_ids": [],
-            "interval_seconds": 300,
+            "interval_seconds": 10,
         }
         await _show_group_picker(query, user_id)
     elif action in {"manage", "active"}:
@@ -1078,7 +1078,7 @@ async def _edit_messages(update: Update, config: dict, words: list[str]) -> None
 
 
 def _interval_text(config: dict) -> str:
-    seconds = int(config.get("interval_seconds", 300))
+    seconds = int(config.get("interval_seconds", 10))
     return (
         f"Current interval: {_interval_label(seconds)} ({seconds} seconds).\n"
         "Options: 5, 10, 20, 30, 60, 120, or 300 seconds, or a custom interval "
@@ -1107,7 +1107,7 @@ async def _show_config(update: Update, config: dict) -> None:
     status = config.get("status", "stopped")
     if config.get("test_mode") and status == "running":
         status += " (private test)"
-    interval = int(config.get("interval_seconds", 300))
+    interval = int(config.get("interval_seconds", 10))
     text = (
         f"Auto-rotation: {config.get('name', 'Unnamed')}\n"
         f"ID: {config['_id']}\n"
@@ -1152,7 +1152,7 @@ async def _list_configs(update: Update) -> None:
         lines.extend([
             "",
             f"{config.get('name', 'Unnamed')} — {status}",
-            f"ID: {config['_id']} | Interval: {int(config.get('interval_seconds', 300))}s",
+            f"ID: {config['_id']} | Interval: {int(config.get('interval_seconds', 10))}s",
             "Groups: " + (", ".join(group_names) if group_names else "none"),
         ])
     await _reply(update, "\n".join(lines))

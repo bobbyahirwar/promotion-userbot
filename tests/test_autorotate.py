@@ -184,6 +184,11 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
         )
         return await autorotate.get_config(str(config["_id"]))
 
+    async def test_new_config_defaults_to_ten_second_interval(self):
+        config = await autorotate.create_config("default-interval")
+
+        self.assertEqual(config["interval_seconds"], 10)
+
     def test_rotation_advances_in_selection_order_without_consecutive_repeat(self):
         selected = ["first", "second", "third"]
         self.assertEqual(autorotate.next_message_index(selected, 0), 0)
@@ -305,7 +310,7 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
             {
                 "group_ids": [101, 202],
                 "message_ids": [first["_id"], second["_id"]],
-                "interval_seconds": 60,
+                "interval_seconds": 10,
             },
             reset_rotation=True,
         )
@@ -329,6 +334,75 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
                 (202, second["_id"]),
             ],
         )
+
+    async def test_group_delivery_failure_does_not_skip_other_selected_groups(self):
+        message = {"_id": ObjectId(), "type": "text", "text": "saved"}
+        await self.db.messages.insert_one(message)
+        await self.db.groups.insert_one({"chat_id": 101, "title": "One"})
+        await self.db.groups.insert_one({"chat_id": 202, "title": "Two"})
+        config = await autorotate.create_config("independent-failures")
+        await autorotate.edit_config(
+            str(config["_id"]),
+            {
+                "group_ids": [101, 202],
+                "message_ids": [message["_id"]],
+                "interval_seconds": 10,
+            },
+            reset_rotation=True,
+        )
+        attempted = []
+
+        async def send_with_failure(bot, chat_id, saved_message):
+            attempted.append(chat_id)
+            if chat_id == 101:
+                raise RuntimeError("group unavailable")
+
+        with patch.object(autorotate, "_send_group", new=send_with_failure):
+            config = await autorotate.get_config(str(config["_id"]))
+            await autorotate._run_group_cycle(config, object(), [message])
+
+        persisted = await autorotate.get_config(str(config["_id"]))
+        self.assertEqual(attempted, [101, 202])
+        self.assertEqual(persisted["next_message_index"], 0)
+        self.assertEqual(persisted["last_message_id"], message["_id"])
+
+    async def test_group_cooldown_uses_floodwait_not_old_global_send_gap(self):
+        await self.db.state.insert_one({
+            "key": "autorotate_last_group_post_at",
+            "value": autorotate._now(),
+        })
+        sleep = AsyncMock()
+
+        with patch.object(autorotate.asyncio, "sleep", new=sleep):
+            await autorotate._wait_for_group_cooldown(self.db)
+        sleep.assert_not_awaited()
+
+        await self.db.state.insert_one({
+            "key": "autorotate_floodwait_until",
+            "value": autorotate._now() + autorotate.timedelta(seconds=30),
+        })
+        with patch.object(autorotate.asyncio, "sleep", new=sleep):
+            await autorotate._wait_for_group_cooldown(self.db)
+        sleep.assert_awaited_once()
+
+    async def test_cycle_deadlines_remain_aligned_to_scheduled_interval(self):
+        config = await self._new_valid_config(interval=10)
+        scheduled_at = autorotate._now() - autorotate.timedelta(seconds=24)
+        await self.db.autorotate_configs.update_one(
+            {"_id": config["_id"]},
+            {"$set": {"next_run_at": scheduled_at}},
+        )
+        config = await autorotate.get_config(str(config["_id"]))
+        message = {"_id": config["message_ids"][0]}
+
+        interval = await autorotate._finish_cycle(config, message, 0)
+
+        persisted = await autorotate.get_config(str(config["_id"]))
+        next_run_at = persisted["next_run_at"]
+        elapsed = (next_run_at - scheduled_at).total_seconds()
+        self.assertEqual(interval, 10)
+        self.assertGreater(next_run_at, autorotate._now())
+        self.assertAlmostEqual(elapsed / interval, round(elapsed / interval), places=5)
 
     async def test_group_sender_preserves_text_media_and_html_captions(self):
         class FakeUserbot:
@@ -526,7 +600,7 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(cycle_count, 2)
         self.assertEqual(len(sleep_delays), 1)
-        self.assertAlmostEqual(sleep_delays[0], 37, delta=0.1)
+        self.assertAlmostEqual(sleep_delays[0], 36, delta=0.1)
         recovered = await autorotate.get_config(str(config["_id"]))
         self.assertEqual(recovered["interval_seconds"], 37)
         self.assertEqual(recovered["status"], "stopped")

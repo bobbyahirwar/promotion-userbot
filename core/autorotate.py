@@ -14,7 +14,6 @@ from database import get_db
 log = logging.getLogger(__name__)
 
 MIN_GROUP_INTERVAL_SECONDS = 5
-MIN_GROUP_SEND_GAP_SECONDS = 60
 MIN_CUSTOM_INTERVAL_SECONDS = 10
 MAX_INTERVAL_SECONDS = 86400
 FLOODWAIT_BUFFER_SECONDS = 5
@@ -95,7 +94,7 @@ async def create_config(name: str) -> dict:
         "name": name or f"Rotation {now.strftime('%Y-%m-%d %H:%M')}",
         "group_ids": [],
         "message_ids": [],
-        "interval_seconds": 300,
+        "interval_seconds": 10,
         "next_message_index": 0,
         "last_message_id": None,
         "status": "stopped",
@@ -223,19 +222,13 @@ async def _download_media(bot, file_id: str) -> io.BytesIO:
 
 async def _wait_for_group_cooldown(db) -> None:
     now = _now()
-    state_docs = await db.state.find({
-        "key": {"$in": ["autorotate_floodwait_until", "autorotate_last_group_post_at"]}
-    }).to_list(2)
+    state_docs = await db.state.find(
+        {"key": "autorotate_floodwait_until"}
+    ).to_list(1)
     state_by_key = {doc["key"]: doc.get("value") for doc in state_docs}
     cooldown_until = _to_datetime(state_by_key.get("autorotate_floodwait_until"))
-    last_sent_at = _to_datetime(state_by_key.get("autorotate_last_group_post_at"))
-    due_times = []
     if cooldown_until:
-        due_times.append(cooldown_until)
-    if last_sent_at:
-        due_times.append(last_sent_at + timedelta(seconds=MIN_GROUP_SEND_GAP_SECONDS))
-    if due_times:
-        delay = (max(due_times) - now).total_seconds()
+        delay = (cooldown_until - now).total_seconds()
         if delay > 0:
             await asyncio.sleep(delay)
 
@@ -244,35 +237,28 @@ async def _send_group(bot, chat_id: int, message: dict) -> None:
     db = get_db()
     async with _group_send_lock:
         await _wait_for_group_cooldown(db)
-        try:
-            message_type = message.get("type")
-            if message_type == "text":
-                html = message.get("html")
-                await userbot.send_message(
-                    chat_id,
-                    html or message["text"],
-                    parse_mode="html" if html else None,
-                )
-            elif message_type in {"photo", "video"}:
-                media = await _download_media(bot, message["file_id"])
-                caption_html = message.get("caption_html")
-                caption = caption_html or message.get("caption") or None
-                parse_mode = "html" if caption_html else None
-                sender = userbot.send_photo if message_type == "photo" else userbot.send_video
-                await sender(
-                    chat_id,
-                    media,
-                    caption=caption,
-                    parse_mode=parse_mode,
-                )
-            else:
-                raise ValueError(f"Unsupported saved message type: {message_type!r}")
-        finally:
-            await db.state.update_one(
-                {"key": "autorotate_last_group_post_at"},
-                {"$set": {"value": _now()}},
-                upsert=True,
+        message_type = message.get("type")
+        if message_type == "text":
+            html = message.get("html")
+            await userbot.send_message(
+                chat_id,
+                html or message["text"],
+                parse_mode="html" if html else None,
             )
+        elif message_type in {"photo", "video"}:
+            media = await _download_media(bot, message["file_id"])
+            caption_html = message.get("caption_html")
+            caption = caption_html or message.get("caption") or None
+            parse_mode = "html" if caption_html else None
+            sender = userbot.send_photo if message_type == "photo" else userbot.send_video
+            await sender(
+                chat_id,
+                media,
+                caption=caption,
+                parse_mode=parse_mode,
+            )
+        else:
+            raise ValueError(f"Unsupported saved message type: {message_type!r}")
 
 
 async def _mark_group_complete(config_id: ObjectId, chat_id: int) -> None:
@@ -328,13 +314,18 @@ async def _finish_cycle(config: dict, message: dict, selected_index: int) -> int
     next_index = (selected_index + 1) % len(config["message_ids"])
     now = _now()
     interval = int(config["interval_seconds"])
+    next_run_at = _to_datetime(config.get("next_run_at")) or now
+    next_run_at += timedelta(seconds=interval)
+    if next_run_at <= now:
+        missed_intervals = int((now - next_run_at).total_seconds() // interval) + 1
+        next_run_at += timedelta(seconds=interval * missed_intervals)
     await _collection().update_one(
         {"_id": config["_id"]},
         {
             "$set": {
                 "next_message_index": next_index,
                 "last_message_id": message["_id"],
-                "next_run_at": now + timedelta(seconds=interval),
+                "next_run_at": next_run_at,
                 "updated_at": now,
             },
             "$unset": {
