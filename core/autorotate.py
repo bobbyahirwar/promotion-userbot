@@ -15,6 +15,8 @@ log = logging.getLogger(__name__)
 
 MIN_GROUP_INTERVAL_SECONDS = 60
 MIN_GROUP_SEND_GAP_SECONDS = 60
+MIN_PRIVATE_TEST_INTERVAL_SECONDS = 10
+MAX_INTERVAL_SECONDS = 86400
 FLOODWAIT_BUFFER_SECONDS = 5
 INTERVAL_PRESETS = {
     "10": 10,
@@ -94,7 +96,10 @@ async def get_config(config_id: str) -> dict | None:
 
 async def edit_config(config_id: str, updates: dict, reset_rotation: bool = False) -> bool:
     object_id = parse_config_id(config_id)
-    fields = {**updates, "updated_at": _now()}
+    now = _now()
+    fields = {**updates, "updated_at": now}
+    if "interval_seconds" in updates:
+        fields["next_run_at"] = now
     update = {"$set": fields}
     config = await _collection().find_one(
         {"_id": object_id, "status": {"$ne": "running"}},
@@ -445,9 +450,9 @@ async def _run_config(config_id: ObjectId, bot) -> None:
             try:
                 messages = await _load_selected_messages(config)
                 if config.get("test_mode"):
-                    interval = await _run_private_test(config, bot, messages)
+                    await _run_private_test(config, bot, messages)
                 else:
-                    interval = await _run_group_cycle(config, bot, messages)
+                    await _run_group_cycle(config, bot, messages)
             except ValueError as exc:
                 await _pause_for_invalid_config(config, str(exc))
                 return
@@ -455,8 +460,6 @@ async def _run_config(config_id: ObjectId, bot) -> None:
             refreshed = await _collection().find_one({"_id": config_id}, {"status": 1})
             if not refreshed or refreshed.get("status") != "running":
                 return
-            if interval > 0:
-                await asyncio.sleep(interval)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -495,12 +498,20 @@ async def _validate_for_start(config: dict, test_mode: bool) -> str | None:
         await _load_selected_messages(config)
     except ValueError as exc:
         return str(exc)
+    interval = int(config.get("interval_seconds", 0))
     if test_mode:
-        if int(config.get("interval_seconds", 0)) < 10:
-            return "Private test intervals must be at least 10 seconds."
+        if not MIN_PRIVATE_TEST_INTERVAL_SECONDS <= interval <= MAX_INTERVAL_SECONDS:
+            return (
+                "Private test intervals must be 10–86400 seconds "
+                "(10, 20, 30 seconds or any custom interval in that range)."
+            )
         return None
-    if int(config.get("interval_seconds", 0)) < MIN_GROUP_INTERVAL_SECONDS:
-        return "Group posting requires an interval of at least 1 minute. Use /autorotate test for private testing."
+    if not MIN_GROUP_INTERVAL_SECONDS <= interval <= MAX_INTERVAL_SECONDS:
+        return (
+            "Group posting intervals must be 60–86400 seconds "
+            "(1 minute, 2 minutes, 5 minutes, or a custom interval); "
+            "10, 20, and 30 seconds are available only with /autorotate test."
+        )
     group_ids = config.get("group_ids", [])
     if not group_ids:
         return "Select at least one authorized group before starting."

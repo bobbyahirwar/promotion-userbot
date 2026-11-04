@@ -151,8 +151,9 @@ async def _show_help(query) -> None:
         "Auto Message Rotation\n\n"
         "Create a configuration, select only groups you explicitly authorize, "
         "choose saved messages and set an interval. Review the summary before saving.\n\n"
-        "Group posting requires at least a 1-minute interval and sends at least "
-        "60 seconds apart globally. Short intervals are available only for private tests.\n"
+        "Group posting allows 1 minute to 24 hours (1m, 2m, 5m, or a custom interval) "
+        "and sends at least 60 seconds apart globally. Private tests allow 10, 20, "
+        "or 30 seconds, or a custom interval from 10 to 86400 seconds.\n"
         "FloodWait pauses rotation; the bot will not retry before Telegram's cooldown expires.",
         _keyboard([[_button("⬅️ Main Menu", "home")]]),
     )
@@ -291,7 +292,8 @@ async def _show_interval_picker(query, user_id: int) -> None:
     await _edit_query(
         query,
         "Choose the rotation interval.\n"
-        "10–30 seconds are for private tests only; group rotation requires at least 1 minute.",
+        "Private tests allow 10, 20, or 30 seconds and custom intervals from 10 to 86400 seconds. "
+        "Group rotation requires 60 to 86400 seconds.",
         _keyboard(rows),
     )
 
@@ -533,7 +535,7 @@ async def _show_custom_interval_prompt(query, user_id: int, context: ContextType
     await _edit_query(
         query,
         "Send a custom interval in seconds (10–86400).\n"
-        "Group posting requires at least 60 seconds.",
+        "Private tests allow 10 seconds or more; group rotation requires at least 60 seconds.",
         _keyboard([[_button("Cancel", "ib")]]),
     )
 
@@ -552,13 +554,15 @@ async def _handle_custom_interval(update: Update, context: ContextTypes.DEFAULT_
         seconds = int(text)
     except ValueError:
         await editor.edit_message_text(
-            "Enter a whole number of seconds between 10 and 86400.",
+            "Enter a whole number of seconds between "
+            f"{autorotate.MIN_PRIVATE_TEST_INTERVAL_SECONDS} and {autorotate.MAX_INTERVAL_SECONDS}.",
             reply_markup=_keyboard([[_button("Cancel", "ib")]]),
         )
         return
-    if not 10 <= seconds <= 86400:
+    if not autorotate.MIN_PRIVATE_TEST_INTERVAL_SECONDS <= seconds <= autorotate.MAX_INTERVAL_SECONDS:
         await editor.edit_message_text(
-            "Interval must be between 10 and 86400 seconds.",
+            "Interval must be between "
+            f"{autorotate.MIN_PRIVATE_TEST_INTERVAL_SECONDS} and {autorotate.MAX_INTERVAL_SECONDS} seconds.",
             reply_markup=_keyboard([[_button("Cancel", "ib")]]),
         )
         return
@@ -1075,9 +1079,10 @@ async def _edit_messages(update: Update, config: dict, words: list[str]) -> None
 def _interval_text(config: dict) -> str:
     seconds = int(config.get("interval_seconds", 300))
     return (
-        f"Current interval: {seconds} seconds.\n"
+        f"Current interval: {_interval_label(seconds)} ({seconds} seconds).\n"
         "Options: 10, 20, 30 (private testing only), 1m, 2m, 5m, "
-        "or a custom number of seconds (minimum 10; group posting requires at least 60)."
+        "or a custom interval from 10 to 86400 seconds. Group posting requires "
+        "at least 60 seconds; 10, 20, and 30 seconds are private-test only."
     )
 
 
@@ -1239,14 +1244,22 @@ async def cmd_autorotate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 await _reply(update, "Use 10, 20, 30, 1m, 2m, 5m, or a custom interval in seconds.")
                 return
-        if seconds < 10:
-            await _reply(update, "Intervals shorter than 10 seconds are not supported.")
+        if not autorotate.MIN_PRIVATE_TEST_INTERVAL_SECONDS <= seconds <= autorotate.MAX_INTERVAL_SECONDS:
+            await _reply(
+                update,
+                "Intervals must be between 10 and 86400 seconds. "
+                "Group posting requires at least 60 seconds; shorter intervals are private-test only.",
+            )
             return
         updated = await autorotate.edit_config(config_id, {"interval_seconds": seconds})
         if not updated:
             await _reply(update, "Pause or stop this configuration before changing its interval.")
             return
-        await _reply(update, f"✅ Interval set to {seconds} seconds. Group posting requires at least 60 seconds.")
+        await _reply(
+            update,
+            f"✅ Interval set to {_interval_label(seconds)} ({seconds} seconds). "
+            "Group posting requires at least 60 seconds; shorter intervals are private-test only.",
+        )
     elif command in {"start", "test"}:
         success, result = await autorotate.start_config(
             config_id,

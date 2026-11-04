@@ -243,6 +243,53 @@ class InlineAutoRotateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(draft["interval_seconds"], 10)
         summary.assert_awaited_once_with(query, draft)
 
+    async def test_interval_button_forwards_selected_seconds_to_backend(self):
+        ui._ui_drafts[1] = {
+            "mode": "edit_interval",
+            "config_id": "config-id",
+            "group_ids": [101],
+            "message_ids": ["message-id"],
+            "interval_seconds": 300,
+        }
+        query = SimpleNamespace(
+            id="interval-edit",
+            data="ar:is:20",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            from_user=SimpleNamespace(id=1),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=1),
+        )
+        with (
+            patch.object(ui.autorotate, "edit_config", new=AsyncMock(return_value=True)) as edit,
+            patch.object(ui, "_show_configuration", new=AsyncMock()),
+        ):
+            await ui.callback_autorotate(update, SimpleNamespace())
+        edit.assert_awaited_once_with("config-id", {"interval_seconds": 20})
+
+    async def test_custom_interval_input_is_saved_as_seconds(self):
+        ui._ui_drafts[1] = {
+            "mode": "edit_interval",
+            "config_id": "config-id",
+            "interval_seconds": 300,
+        }
+        ui._custom_interval_inputs[1] = {"chat_id": 1, "message_id": 55}
+        message = SimpleNamespace(text="47", chat_id=1)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            effective_message=message,
+        )
+        bot = SimpleNamespace(edit_message_text=AsyncMock())
+        with (
+            patch.object(ui.autorotate, "edit_config", new=AsyncMock(return_value=True)) as edit,
+            patch.object(ui, "_show_configuration", new=AsyncMock()),
+        ):
+            await ui._handle_custom_interval(update, SimpleNamespace(bot=bot))
+        edit.assert_awaited_once_with("config-id", {"interval_seconds": 47})
+        self.assertNotIn(1, ui._custom_interval_inputs)
+
     async def test_configuration_creation_persists_only_the_staged_selection(self):
         config = {"_id": "config-id"}
         draft = {

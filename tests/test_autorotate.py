@@ -5,7 +5,7 @@ import io
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 try:
     asyncio.get_running_loop()
@@ -462,8 +462,83 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
     async def test_group_rotation_rejects_fast_intervals_but_private_test_allows_them(self):
         config = await self._new_valid_config(interval=30)
         error = await autorotate._validate_for_start(config, test_mode=False)
-        self.assertIn("at least 1 minute", error)
-        self.assertIsNone(await autorotate._validate_for_start(config, test_mode=True))
+        self.assertIn("60–86400 seconds", error)
+        self.assertIn("10, 20, and 30 seconds", error)
+        for interval in (10, 20, 30, 47, 86400):
+            config["interval_seconds"] = interval
+            self.assertIsNone(
+                await autorotate._validate_for_start(config, test_mode=True),
+                f"{interval} seconds should be accepted for private tests",
+            )
+        for interval in (9, 86401):
+            config["interval_seconds"] = interval
+            self.assertIn(
+                "10–86400 seconds",
+                await autorotate._validate_for_start(config, test_mode=True),
+            )
+
+        config["interval_seconds"] = 59
+        self.assertIn("60–86400 seconds", await autorotate._validate_for_start(config, test_mode=False))
+        config["interval_seconds"] = 60
+        self.assertIsNone(await autorotate._validate_for_start(config, test_mode=False))
+
+    async def test_custom_interval_persists_and_scheduler_recovery_uses_it_once(self):
+        config = await self._new_valid_config(interval=300)
+        await self.db.autorotate_configs.update_one(
+            {"_id": config["_id"]},
+            {"$set": {
+                "status": "paused",
+                "next_run_at": autorotate._now() + autorotate.timedelta(seconds=300),
+            }},
+        )
+        self.assertTrue(
+            await autorotate.edit_config(str(config["_id"]), {"interval_seconds": 37})
+        )
+        persisted = await autorotate.get_config(str(config["_id"]))
+        self.assertEqual(persisted["interval_seconds"], 37)
+        self.assertLessEqual(persisted["next_run_at"], autorotate._now())
+        await self.db.autorotate_configs.update_one(
+            {"_id": config["_id"]},
+            {"$set": {
+                "status": "running",
+                "test_mode": True,
+                "next_run_at": autorotate._now() - autorotate.timedelta(seconds=1),
+            }},
+        )
+
+        message = {"_id": config["message_ids"][0], "type": "text", "text": "saved"}
+        cycle_count = 0
+        sleep_delays = []
+
+        async def run_private_cycle(current, bot, messages):
+            nonlocal cycle_count
+            cycle_count += 1
+            await autorotate._finish_cycle(current, messages[0], 0)
+            if cycle_count == 2:
+                await self.db.autorotate_configs.update_one(
+                    {"_id": current["_id"]},
+                    {"$set": {"status": "stopped"}},
+                )
+            return int(current["interval_seconds"])
+
+        async def record_sleep(delay):
+            sleep_delays.append(delay)
+
+        with (
+            patch.object(autorotate, "_load_selected_messages", new=AsyncMock(return_value=[message])),
+            patch.object(autorotate, "_run_private_test", new=run_private_cycle),
+            patch.object(autorotate.asyncio, "sleep", new=record_sleep),
+        ):
+            self.assertEqual(await autorotate.restore_running_configs(object()), 1)
+            task = autorotate._jobs[str(config["_id"])]
+            await task
+
+        self.assertEqual(cycle_count, 2)
+        self.assertEqual(len(sleep_delays), 1)
+        self.assertAlmostEqual(sleep_delays[0], 37, delta=0.1)
+        recovered = await autorotate.get_config(str(config["_id"]))
+        self.assertEqual(recovered["interval_seconds"], 37)
+        self.assertEqual(recovered["status"], "stopped")
 
     async def test_floodwait_is_persisted_and_blocks_resume(self):
         config = await self._new_valid_config()
