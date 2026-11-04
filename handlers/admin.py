@@ -42,6 +42,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addblacklist <number|id> — Add a group to the blacklist\n"
         "/removeblacklist <number> — Remove a group from the blacklist\n\n"
         "📣 Promotion\n"
+        "/autorotate — Configure multi-group saved-message rotation\n"
         "/startpromo — Start automatic promotion\n"
         "/stoppromo — Stop automatic promotion\n"
         "/debugpromo — Toggle live debug updates (on/off)\n"

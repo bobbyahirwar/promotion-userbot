@@ -36,8 +36,10 @@ async def main():
     from core.userbot import userbot
     from database import init_db, get_db
     from handlers import admin, messages, groups, promo, blacklist, stats, inactive_groups
+    from handlers import autorotate as autorotate_handler
     import handlers.sync_groups as sync_groups_mod
     import handlers.health as health_mod
+    from core import autorotate
     from handlers.groups import validate_and_clean_groups
     from handlers.sync_groups import sync_joined_groups
     from core.promotion import restore_state
@@ -51,6 +53,7 @@ async def main():
     blacklist.register(bot_app)
     stats.register(bot_app)
     inactive_groups.register(bot_app)
+    autorotate_handler.register(bot_app)
     sync_groups_mod.register(bot_app)
     health_mod.register(bot_app)
 
@@ -100,6 +103,13 @@ async def main():
         await db.stats.delete_many(
             {"key": {"$in": ["total_sent", "total_failed", "last_promotion_time"]}}
         )
+        await db.autorotate_configs.update_many(
+            {"status": "running"},
+            {"$set": {
+                "status": "paused",
+                "last_error": "Userbot account changed; review selected groups before resuming.",
+            }},
+        )
         print("✅ Stale groups, inactive list, and stats cleared.")
 
     # Persist the current account ID so future startups can detect a change.
@@ -135,12 +145,18 @@ async def main():
     # Resume promotion if it was running before restart
     await restore_state(bot_app.bot)
 
+    # Restore owner-configured message rotations after group synchronization and
+    # validation so only currently available, explicitly selected groups run.
+    restored_rotations = await autorotate.restore_running_configs(bot_app.bot)
+    print(f"✅ Auto-rotation configurations restored: {restored_rotations}")
+
     print("✅ Promotion System Ready")
 
     # Keep running until cancelled
     try:
         await asyncio.Event().wait()
     finally:
+        await autorotate.shutdown()
         await bot_app.updater.stop()
         await bot_app.stop()
         await bot_app.shutdown()

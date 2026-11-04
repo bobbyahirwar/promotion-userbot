@@ -38,18 +38,24 @@ async def cmd_addmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if replied.text:
         doc = {"type": "text", "text": replied.text}
+        if replied.entities:
+            doc["html"] = replied.text_html
     elif replied.photo:
         doc = {
             "type": "photo",
             "file_id": replied.photo[-1].file_id,
             "caption": replied.caption or "",
         }
+        if replied.caption_entities:
+            doc["caption_html"] = replied.caption_html
     elif replied.video:
         doc = {
             "type": "video",
             "file_id": replied.video.file_id,
             "caption": replied.caption or "",
         }
+        if replied.caption_entities:
+            doc["caption_html"] = replied.caption_html
     else:
         await update.message.reply_text("❌ Unsupported message type. Send text, photo, or video.")
         return
