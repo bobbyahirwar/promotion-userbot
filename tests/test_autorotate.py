@@ -221,6 +221,32 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
             [],
         )
 
+    async def test_selected_saved_messages_load_from_storage_in_configured_order(self):
+        first = {
+            "_id": ObjectId(),
+            "type": "photo",
+            "file_id": "photo-id",
+            "caption": "first caption",
+            "caption_html": "<b>first caption</b>",
+        }
+        second = {
+            "_id": ObjectId(),
+            "type": "video",
+            "file_id": "video-id",
+            "caption": "second caption",
+        }
+        await self.db.messages.insert_one(first)
+        await self.db.messages.insert_one(second)
+
+        selected = await autorotate._load_selected_messages({
+            "message_ids": [second["_id"], first["_id"]],
+        })
+
+        self.assertEqual([message["_id"] for message in selected], [second["_id"], first["_id"]])
+        self.assertEqual(selected[0]["caption"], "second caption")
+        self.assertEqual(selected[0]["file_id"], "video-id")
+        self.assertEqual(selected[1]["caption_html"], "<b>first caption</b>")
+
     async def test_group_selection_selects_all_and_supports_add_remove(self):
         groups = [{"chat_id": 101}, {"chat_id": 202}, {"chat_id": 303}]
         selected_all = await _parse_selection(

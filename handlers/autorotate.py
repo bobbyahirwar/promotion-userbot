@@ -348,7 +348,7 @@ async def _configuration_text(config: dict) -> str:
     messages = await db.messages.find({"_id": {"$in": message_ids}}).to_list(len(message_ids))
     message_by_id = {message["_id"]: message for message in messages}
     message_lines = [
-        f"• {_row_label(_preview(message), 48)}" if message_id in message_by_id
+        f"• {_row_label(_preview(message_by_id[message_id]), 48)}" if message_id in message_by_id
         else f"• {message_id} (deleted)"
         for message_id in message_ids[:10]
     ]

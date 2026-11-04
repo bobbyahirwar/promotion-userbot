@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from bson import ObjectId
+
 try:
     asyncio.get_running_loop()
     _IMPORT_LOOP = None
@@ -26,6 +28,33 @@ from handlers import autorotate as ui
 if _IMPORT_LOOP:
     _IMPORT_LOOP.close()
     asyncio.set_event_loop(None)
+
+
+class _MemoryCursor:
+    def __init__(self, documents):
+        self.documents = list(documents)
+
+    def sort(self, key, direction=1):
+        self.documents.sort(key=lambda document: document.get(key), reverse=direction < 0)
+        return self
+
+    async def to_list(self, length):
+        return self.documents if length is None else self.documents[:length]
+
+
+class _MemoryCollection:
+    def __init__(self, documents):
+        self.documents = documents
+
+    def find(self, query=None, projection=None):
+        query = query or {}
+        selected = self.documents
+        for key, expected in query.items():
+            if isinstance(expected, dict) and "$in" in expected:
+                selected = [document for document in selected if document.get(key) in expected["$in"]]
+            else:
+                selected = [document for document in selected if document.get(key) == expected]
+        return _MemoryCursor(selected)
 
 
 class InlineAutoRotateTests(unittest.IsolatedAsyncioTestCase):
@@ -235,6 +264,77 @@ class InlineAutoRotateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(edit.await_args.args[1]["message_ids"], ["one", "two"])
         self.assertEqual(edit.await_args.args[1]["interval_seconds"], 120)
         self.assertEqual(edit.await_args.args[1]["status"], "stopped")
+
+    async def test_multi_select_callback_flow_saves_and_displays_selected_messages(self):
+        groups = [{"chat_id": 101, "title": "First"}, {"chat_id": 202, "title": "Second"}]
+        first_id, second_id = ObjectId(), ObjectId()
+        messages = [
+            {"_id": first_id, "type": "text", "text": "first saved message"},
+            {"_id": second_id, "type": "text", "text": "second saved message"},
+        ]
+        config = {
+            "_id": "config-id",
+            "name": "Rotation",
+            "group_ids": [],
+            "message_ids": [],
+            "interval_seconds": 300,
+            "status": "stopped",
+        }
+        db = SimpleNamespace(
+            groups=_MemoryCollection(groups),
+            messages=_MemoryCollection(messages),
+        )
+
+        async def edit_config(config_id, updates, reset_rotation=False):
+            config.update(updates)
+            return True
+
+        query = SimpleNamespace(
+            id="flow-0",
+            data="ar:create",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            from_user=SimpleNamespace(id=1),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=1),
+        )
+        context = SimpleNamespace(bot=object())
+
+        async def click(data, callback_id):
+            query.data = data
+            query.id = callback_id
+            await ui.callback_autorotate(update, context)
+
+        with (
+            patch.object(ui, "_load_pickable_groups", new=AsyncMock(return_value=(groups, set()))),
+            patch.object(ui, "_load_pickable_messages", new=AsyncMock(return_value=messages)),
+            patch.object(ui, "get_db", return_value=db),
+            patch.object(ui.autorotate, "create_config", new=AsyncMock(return_value=config)),
+            patch.object(ui.autorotate, "edit_config", new=AsyncMock(side_effect=edit_config)) as edit,
+            patch.object(ui.autorotate, "get_config", new=AsyncMock(return_value=config)),
+            patch.object(ui.autorotate, "_is_duplicate", new=AsyncMock(return_value=False)),
+        ):
+            await click("ar:create", "flow-0")
+            await click("ar:gt:101:0", "flow-1")
+            await click("ar:gt:202:0", "flow-2")
+            await click("ar:gn:0", "flow-3")
+            await click(f"ar:mt:{second_id}:0", "flow-4")
+            await click(f"ar:mt:{first_id}:0", "flow-5")
+            await click("ar:mn:0", "flow-6")
+            await click("ar:is:60", "flow-7")
+            await click("ar:ok:config-id", "flow-8")
+
+        self.assertEqual(config["group_ids"], [101, 202])
+        self.assertEqual(config["message_ids"], [second_id, first_id])
+        self.assertEqual(
+            edit.await_args_list[-2].args[1]["message_ids"],
+            [second_id, first_id],
+        )
+        rendered = query.edit_message_text.await_args.kwargs["text"]
+        self.assertIn("Configuration saved.", rendered)
+        self.assertLess(rendered.index("second saved message"), rendered.index("first saved message"))
 
     async def test_configuration_edits_persist_groups_and_messages(self):
         ui._ui_drafts[1] = {
