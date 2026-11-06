@@ -454,16 +454,28 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_floodwait_resumes_pending_groups_without_duplicate_success(self):
         first = {"_id": ObjectId(), "type": "text", "text": "first"}
+        second = {"_id": ObjectId(), "type": "text", "text": "second"}
         await self.db.messages.insert_one(first)
+        await self.db.messages.insert_one(second)
         await self.db.groups.insert_one({"chat_id": 101, "title": "One"})
         await self.db.groups.insert_one({"chat_id": 202, "title": "Two"})
         config = await autorotate.create_config("flood-resume")
         await autorotate.edit_config(
             str(config["_id"]),
-            {"group_ids": [101, 202], "message_ids": [first["_id"]]},
+            {"group_ids": [101, 202], "message_ids": [first["_id"], second["_id"]]},
             reset_rotation=True,
         )
+        await self.db.autorotate_configs.update_one(
+            {"_id": config["_id"]},
+            {"$set": {
+                "status": "running",
+                "next_message_index": 1,
+                "last_message_id": first["_id"],
+            }},
+        )
         attempted = []
+        current_time = [autorotate._now()]
+        original_sleep = asyncio.sleep
 
         class FakeFloodWait(Exception):
             def __init__(self, value):
@@ -474,23 +486,47 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
             if chat_id == 202 and attempted.count(202) == 1:
                 raise FakeFloodWait(30)
 
-        with patch.object(autorotate, "FloodWait", FakeFloodWait), patch.object(
-            autorotate, "_send_group", new=send_with_wait
+        async def advance_time(delay):
+            current_time[0] += autorotate.timedelta(seconds=delay)
+            await original_sleep(0)
+
+        async def run_resumed_cycle(config_id, bot):
+            resumed_config = await autorotate.get_config(str(config_id))
+            messages = await autorotate._load_selected_messages(resumed_config)
+            await autorotate._run_group_cycle(resumed_config, bot, messages)
+            await self.db.autorotate_configs.update_one(
+                {"_id": config_id},
+                {"$set": {"status": "stopped"}},
+            )
+
+        with (
+            patch.object(autorotate, "FloodWait", FakeFloodWait),
+            patch.object(autorotate, "_send_group", new=send_with_wait),
+            patch.object(autorotate, "_now", side_effect=lambda: current_time[0]),
+            patch.object(autorotate.asyncio, "sleep", new=advance_time),
+            patch.object(autorotate, "_run_config", new=run_resumed_cycle),
         ):
             config = await autorotate.get_config(str(config["_id"]))
-            self.assertEqual(await autorotate._run_group_cycle(config, object(), [first]), 0)
+            self.assertEqual(
+                await autorotate._run_group_cycle(config, object(), [first, second]),
+                0,
+            )
             paused = await autorotate.get_config(str(config["_id"]))
             self.assertEqual(paused["status"], "paused")
             self.assertEqual(paused["pending_completed_group_ids"], [101])
-
-            await self.db.autorotate_configs.update_one(
-                {"_id": config["_id"]},
-                {"$set": {"status": "running", "resume_after": None}},
-            )
-            resumed = await autorotate.get_config(str(config["_id"]))
-            await autorotate._run_group_cycle(resumed, object(), [first])
+            self.assertEqual(paused["pending_message_id"], second["_id"])
+            self.assertEqual(paused["pending_message_index"], 1)
+            self.assertEqual(paused["group_ids"], [101, 202])
+            recovery = autorotate._recovery_jobs[str(config["_id"])]
+            await recovery
+            await autorotate._jobs[str(config["_id"])]
 
         self.assertEqual(attempted, [101, 202, 202])
+        completed = await autorotate.get_config(str(config["_id"]))
+        self.assertEqual(completed["status"], "stopped")
+        self.assertEqual(completed["next_message_index"], 0)
+        self.assertEqual(completed["last_message_id"], second["_id"])
+        self.assertNotIn("pending_message_id", completed)
 
     async def test_configs_persist_independently_and_schedule_once(self):
         first = await self._new_valid_config("first", chat_id=101)
@@ -607,15 +643,229 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_floodwait_is_persisted_and_blocks_resume(self):
         config = await self._new_valid_config()
+        await self.db.autorotate_configs.update_one(
+            {"_id": config["_id"]},
+            {"$set": {"status": "running"}},
+        )
         await autorotate._pause_after_wait(config, 120, "FloodWait")
         paused = await autorotate.get_config(str(config["_id"]))
         self.assertEqual(paused["status"], "paused")
         self.assertIsNotNone(paused.get("resume_after"))
+        self.assertTrue(paused["auto_resume"])
         started, message = await autorotate.start_config(str(config["_id"]), object())
         self.assertFalse(started)
         self.assertIn("cooldown is active", message)
         cooldown = await self.db.state.find_one({"key": "autorotate_floodwait_until"})
         self.assertEqual(cooldown["value"], paused["resume_after"])
+
+    async def test_floodwait_automatically_resumes_after_exact_wait(self):
+        config = await self._new_valid_config()
+        await self.db.autorotate_configs.update_one(
+            {"_id": config["_id"]},
+            {"$set": {"status": "running"}},
+        )
+        current_time = [autorotate._now()]
+        sleep_delays = []
+        original_sleep = asyncio.sleep
+
+        async def advance_time(delay):
+            sleep_delays.append(delay)
+            current_time[0] += autorotate.timedelta(seconds=delay)
+            await original_sleep(0)
+
+        async def wait_forever(config_id, bot):
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(autorotate, "_now", side_effect=lambda: current_time[0]),
+            patch.object(autorotate.asyncio, "sleep", new=advance_time),
+            patch.object(autorotate, "_run_config", new=wait_forever),
+        ):
+            await autorotate._pause_after_wait(config, 30, "FloodWait", object())
+            paused = await autorotate.get_config(str(config["_id"]))
+            recovery = autorotate._recovery_jobs[str(config["_id"])]
+            await recovery
+
+        resumed = await autorotate.get_config(str(config["_id"]))
+        self.assertEqual(sleep_delays, [30])
+        self.assertEqual(current_time[0], paused["resume_after"])
+        self.assertEqual(resumed["status"], "running")
+        self.assertNotIn("resume_after", resumed)
+        self.assertEqual(resumed["next_message_index"], config["next_message_index"])
+        await autorotate.shutdown()
+
+    async def test_pending_floodwait_recovery_restores_after_restart(self):
+        config = await self._new_valid_config()
+        await self.db.autorotate_configs.update_one(
+            {"_id": config["_id"]},
+            {"$set": {"status": "running"}},
+        )
+        current_time = [autorotate._now()]
+        original_sleep = asyncio.sleep
+
+        async def advance_time(delay):
+            current_time[0] += autorotate.timedelta(seconds=delay)
+            await original_sleep(0)
+
+        async def wait_forever(config_id, bot):
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(autorotate, "_now", side_effect=lambda: current_time[0]),
+            patch.object(autorotate.asyncio, "sleep", new=advance_time),
+            patch.object(autorotate, "_run_config", new=wait_forever),
+        ):
+            await autorotate._pause_after_wait(config, 45, "FloodWait")
+            deadline = (await autorotate.get_config(str(config["_id"])))["resume_after"]
+            self.assertEqual(autorotate._recovery_jobs, {})
+            self.assertEqual(await autorotate.restore_running_configs(object()), 0)
+            recovery = autorotate._recovery_jobs[str(config["_id"])]
+            await recovery
+
+        restored = await autorotate.get_config(str(config["_id"]))
+        self.assertEqual(restored["status"], "running")
+        self.assertEqual(current_time[0], deadline)
+        await autorotate.shutdown()
+
+    async def test_multiple_floodwait_recoveries_are_independent(self):
+        first = await self._new_valid_config("first", chat_id=101)
+        second = await self._new_valid_config("second", chat_id=202)
+        for config in (first, second):
+            await self.db.autorotate_configs.update_one(
+                {"_id": config["_id"]},
+                {"$set": {"status": "running"}},
+            )
+
+        current_time = [autorotate._now()]
+        sleep_delays = []
+        original_sleep = asyncio.sleep
+
+        async def advance_time(delay):
+            sleep_delays.append(delay)
+            current_time[0] += autorotate.timedelta(seconds=delay)
+            await original_sleep(0)
+
+        async def wait_forever(config_id, bot):
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(autorotate, "_now", side_effect=lambda: current_time[0]),
+            patch.object(autorotate.asyncio, "sleep", new=advance_time),
+            patch.object(autorotate, "_run_config", new=wait_forever),
+        ):
+            await autorotate._pause_after_wait(first, 10, "FloodWait", object())
+            await autorotate._pause_after_wait(second, 25, "FloodWait", object())
+            first_deadline = (await autorotate.get_config(str(first["_id"])))["resume_after"]
+            second_deadline = (await autorotate.get_config(str(second["_id"])))["resume_after"]
+            first_recovery = autorotate._recovery_jobs[str(first["_id"])]
+            second_recovery = autorotate._recovery_jobs[str(second["_id"])]
+            self.assertIsNot(first_recovery, second_recovery)
+            await asyncio.gather(first_recovery, second_recovery)
+
+        self.assertEqual((first_deadline - current_time[0]).total_seconds(), -15)
+        self.assertEqual((second_deadline - first_deadline).total_seconds(), 15)
+        self.assertEqual(
+            (await autorotate.get_config(str(first["_id"])))["status"],
+            "running",
+        )
+        self.assertEqual(
+            (await autorotate.get_config(str(second["_id"])))["status"],
+            "running",
+        )
+        await autorotate.shutdown()
+
+    async def test_manual_pause_and_stop_cancel_pending_auto_recovery(self):
+        paused = await self._new_valid_config("manual-pause", chat_id=101)
+        stopped = await self._new_valid_config("manual-stop", chat_id=202)
+        current_time = [autorotate._now()]
+        original_sleep = asyncio.sleep
+
+        async def advance_time(delay):
+            current_time[0] += autorotate.timedelta(seconds=delay)
+            await original_sleep(0)
+
+        async def wait_forever(config_id, bot):
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(autorotate, "_now", side_effect=lambda: current_time[0]),
+            patch.object(autorotate.asyncio, "sleep", new=advance_time),
+            patch.object(autorotate, "_run_config", new=wait_forever),
+        ):
+            for config in (paused, stopped):
+                await self.db.autorotate_configs.update_one(
+                    {"_id": config["_id"]},
+                    {"$set": {"status": "running"}},
+                )
+                await autorotate._pause_after_wait(config, 20, "FloodWait", object())
+
+            self.assertTrue(await autorotate.pause_config(str(paused["_id"])))
+            self.assertTrue(await autorotate.stop_config(str(stopped["_id"])))
+            current_time[0] += autorotate.timedelta(seconds=30)
+            self.assertEqual(await autorotate.restore_running_configs(object()), 0)
+
+        paused_after = await autorotate.get_config(str(paused["_id"]))
+        stopped_after = await autorotate.get_config(str(stopped["_id"]))
+        self.assertEqual(paused_after["status"], "paused")
+        self.assertFalse(paused_after.get("auto_resume", False))
+        self.assertEqual(stopped_after["status"], "stopped")
+        self.assertFalse(stopped_after.get("auto_resume", False))
+        await autorotate.shutdown()
+
+    async def test_repeated_floodwait_schedules_a_new_recovery(self):
+        config = await self._new_valid_config()
+        await self.db.autorotate_configs.update_one(
+            {"_id": config["_id"]},
+            {"$set": {"status": "running"}},
+        )
+        current_time = [autorotate._now()]
+        initial_time = current_time[0]
+        original_sleep = asyncio.sleep
+
+        async def advance_time(delay):
+            current_time[0] += autorotate.timedelta(seconds=delay)
+            await original_sleep(0)
+
+        async def wait_forever(config_id, bot):
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(autorotate, "_now", side_effect=lambda: current_time[0]),
+            patch.object(autorotate.asyncio, "sleep", new=advance_time),
+            patch.object(autorotate, "_run_config", new=wait_forever),
+        ):
+            await autorotate._pause_after_wait(config, 10, "FloodWait", object())
+            first_recovery = autorotate._recovery_jobs[str(config["_id"])]
+            await first_recovery
+            await autorotate._cancel_job(config["_id"])
+
+            resumed = await autorotate.get_config(str(config["_id"]))
+            await autorotate._pause_after_wait(resumed, 20, "FloodWait", object())
+            second_recovery = autorotate._recovery_jobs[str(config["_id"])]
+            self.assertIsNot(first_recovery, second_recovery)
+            await second_recovery
+
+        self.assertEqual(current_time[0], initial_time + autorotate.timedelta(seconds=30))
+        self.assertEqual(
+            (await autorotate.get_config(str(config["_id"])))["status"],
+            "running",
+        )
+        await autorotate.shutdown()
+
+    async def test_only_one_recovery_job_is_scheduled_per_configuration(self):
+        config = await self._new_valid_config()
+        await self.db.autorotate_configs.update_one(
+            {"_id": config["_id"]},
+            {"$set": {"status": "running"}},
+        )
+        await autorotate._pause_after_wait(config, 120, "FloodWait")
+        pending = await autorotate.get_config(str(config["_id"]))
+
+        self.assertTrue(autorotate._ensure_recovery_job(pending, object()))
+        task = autorotate._recovery_jobs[str(config["_id"])]
+        self.assertFalse(autorotate._ensure_recovery_job(pending, object()))
+        self.assertIs(autorotate._recovery_jobs[str(config["_id"])], task)
+        self.assertEqual(len(autorotate._recovery_jobs), 1)
 
     async def test_running_configuration_restores_after_scheduler_restart(self):
         config = await self._new_valid_config()

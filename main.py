@@ -110,6 +110,13 @@ async def main():
                 "last_error": "Userbot account changed; review selected groups before resuming.",
             }},
         )
+        await db.autorotate_configs.update_many(
+            {"auto_resume": True},
+            {"$set": {
+                "last_error": "Userbot account changed; review selected groups before resuming.",
+                "updated_at": autorotate._now(),
+            }, "$unset": {"auto_resume": ""}},
+        )
         print("✅ Stale groups, inactive list, and stats cleared.")
 
     # Persist the current account ID so future startups can detect a change.

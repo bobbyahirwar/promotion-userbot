@@ -16,7 +16,6 @@ log = logging.getLogger(__name__)
 MIN_GROUP_INTERVAL_SECONDS = 5
 MIN_CUSTOM_INTERVAL_SECONDS = 10
 MAX_INTERVAL_SECONDS = 86400
-FLOODWAIT_BUFFER_SECONDS = 5
 INTERVAL_PRESETS = {
     "5": 5,
     "10": 10,
@@ -37,6 +36,7 @@ INTERVAL_PRESET_LABELS = {
 }
 
 _jobs: dict[str, asyncio.Task] = {}
+_recovery_jobs: dict[str, asyncio.Task] = {}
 _group_send_lock = asyncio.Lock()
 _media_cache: dict[str, bytes] = {}
 
@@ -233,32 +233,47 @@ async def _wait_for_group_cooldown(db) -> None:
             await asyncio.sleep(delay)
 
 
+async def _persist_floodwait_cooldown(wait_seconds: int, now: datetime | None = None) -> datetime:
+    now = now or _now()
+    resume_after = now + timedelta(seconds=max(0, int(wait_seconds)))
+    await get_db().state.update_one(
+        {"key": "autorotate_floodwait_until"},
+        {"$set": {"value": resume_after, "updated_at": now}},
+        upsert=True,
+    )
+    return resume_after
+
+
 async def _send_group(bot, chat_id: int, message: dict) -> None:
     db = get_db()
     async with _group_send_lock:
         await _wait_for_group_cooldown(db)
-        message_type = message.get("type")
-        if message_type == "text":
-            html = message.get("html")
-            await userbot.send_message(
-                chat_id,
-                html or message["text"],
-                parse_mode="html" if html else None,
-            )
-        elif message_type in {"photo", "video"}:
-            media = await _download_media(bot, message["file_id"])
-            caption_html = message.get("caption_html")
-            caption = caption_html or message.get("caption") or None
-            parse_mode = "html" if caption_html else None
-            sender = userbot.send_photo if message_type == "photo" else userbot.send_video
-            await sender(
-                chat_id,
-                media,
-                caption=caption,
-                parse_mode=parse_mode,
-            )
-        else:
-            raise ValueError(f"Unsupported saved message type: {message_type!r}")
+        try:
+            message_type = message.get("type")
+            if message_type == "text":
+                html = message.get("html")
+                await userbot.send_message(
+                    chat_id,
+                    html or message["text"],
+                    parse_mode="html" if html else None,
+                )
+            elif message_type in {"photo", "video"}:
+                media = await _download_media(bot, message["file_id"])
+                caption_html = message.get("caption_html")
+                caption = caption_html or message.get("caption") or None
+                parse_mode = "html" if caption_html else None
+                sender = userbot.send_photo if message_type == "photo" else userbot.send_video
+                await sender(
+                    chat_id,
+                    media,
+                    caption=caption,
+                    parse_mode=parse_mode,
+                )
+            else:
+                raise ValueError(f"Unsupported saved message type: {message_type!r}")
+        except FloodWait as exc:
+            await _persist_floodwait_cooldown(int(exc.value))
+            raise
 
 
 async def _mark_group_complete(config_id: ObjectId, chat_id: int) -> None:
@@ -268,43 +283,56 @@ async def _mark_group_complete(config_id: ObjectId, chat_id: int) -> None:
     )
 
 
-async def _pause_after_wait(config: dict, wait_seconds: int, reason: str) -> None:
+async def _pause_after_wait(config: dict, wait_seconds: int, reason: str, bot=None) -> None:
     now = _now()
-    resume_after = now + timedelta(seconds=max(1, wait_seconds) + FLOODWAIT_BUFFER_SECONDS)
-    await _collection().update_one(
-        {"_id": config["_id"]},
-        {"$set": {
-            "status": "paused",
-            "resume_after": resume_after,
-            "last_error": f"{reason}: Telegram requires waiting {max(1, wait_seconds)} seconds.",
-            "updated_at": now,
-        }},
+    wait_seconds = max(0, int(wait_seconds))
+    resume_after = now + timedelta(seconds=wait_seconds)
+    fields = {
+        "status": "paused",
+        "resume_after": resume_after,
+        "last_error": f"{reason}: Telegram requires waiting {wait_seconds} seconds.",
+        "updated_at": now,
+    }
+    update = {"$set": fields}
+    if reason == "FloodWait":
+        fields["auto_resume"] = True
+    else:
+        update["$unset"] = {"auto_resume": ""}
+    result = await _collection().update_one(
+        {"_id": config["_id"], "status": "running"},
+        update,
     )
     if reason == "FloodWait":
-        await get_db().state.update_one(
-            {"key": "autorotate_floodwait_until"},
-            {"$set": {"value": resume_after, "updated_at": now}},
-            upsert=True,
-        )
+        await _persist_floodwait_cooldown(wait_seconds, now)
     await _write_log(
         config,
         "paused",
         reason=reason,
-        wait_seconds=max(1, wait_seconds),
+        wait_seconds=wait_seconds,
         resume_after=resume_after,
     )
+    if reason == "FloodWait" and result.matched_count and bot is not None:
+        config.update(fields)
+        if _ensure_recovery_job(config, bot):
+            log.info(
+                "Auto-rotation %s FloodWait recovery scheduled for %s",
+                config["_id"],
+                resume_after.isoformat(),
+            )
     log.warning(
-        "Auto-rotation %s paused for %s (%ss)",
+        "Auto-rotation %s paused for %s (%ss); recovery at %s",
         config["_id"],
         reason,
-        max(1, wait_seconds),
+        wait_seconds,
+        resume_after.isoformat(),
     )
 
 
 async def _pause_for_invalid_config(config: dict, error: str) -> None:
     await _collection().update_one(
         {"_id": config["_id"]},
-        {"$set": {"status": "paused", "last_error": error, "updated_at": _now()}},
+        {"$set": {"status": "paused", "last_error": error, "updated_at": _now()},
+         "$unset": {"auto_resume": ""}},
     )
     await _write_log(config, "paused", error=error)
     log.error("Auto-rotation %s paused: %s", config["_id"], error)
@@ -412,7 +440,7 @@ async def _run_group_cycle(config: dict, bot, messages: list[dict]) -> int:
         try:
             await _send_group(bot, chat_id, message)
         except FloodWait as exc:
-            await _pause_after_wait(config, int(exc.value), "FloodWait")
+            await _pause_after_wait(config, int(exc.value), "FloodWait", bot)
             return 0
         except SlowmodeWait as exc:
             await _pause_after_wait(config, int(exc.value), "SlowmodeWait")
@@ -498,6 +526,135 @@ async def _cancel_job(config_id: ObjectId) -> None:
     if task and not task.done():
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def _cancel_recovery_job(config_id: ObjectId) -> None:
+    task = _recovery_jobs.pop(_config_key(config_id), None)
+    if task and not task.done() and task is not asyncio.current_task():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _recover_after_floodwait(config_id: ObjectId, bot) -> None:
+    key = _config_key(config_id)
+    try:
+        while True:
+            config = await _collection().find_one({"_id": config_id})
+            if (
+                not config
+                or config.get("status") != "paused"
+                or not config.get("auto_resume")
+            ):
+                log.info(
+                    "Auto-rotation %s FloodWait recovery cancelled; configuration is no longer eligible",
+                    key,
+                )
+                return
+
+            resume_after = _to_datetime(config.get("resume_after"))
+            if not resume_after:
+                log.error("Auto-rotation %s FloodWait recovery has no valid resume time", key)
+                return
+            delay = (resume_after - _now()).total_seconds()
+            if delay > 0:
+                await asyncio.sleep(delay)
+                continue
+
+            # A paused config's previous scheduler task may still be unwinding.
+            previous_job = _jobs.get(key)
+            if previous_job and not previous_job.done() and previous_job is not asyncio.current_task():
+                await asyncio.gather(previous_job, return_exceptions=True)
+
+            config = await _collection().find_one({"_id": config_id})
+            if (
+                not config
+                or config.get("status") != "paused"
+                or not config.get("auto_resume")
+                or _to_datetime(config.get("resume_after")) != resume_after
+            ):
+                log.info("Auto-rotation %s FloodWait recovery cancelled before resume", key)
+                return
+
+            error = await _validate_for_start(config, bool(config.get("test_mode")))
+            if error:
+                await _collection().update_one(
+                    {
+                        "_id": config_id,
+                        "status": "paused",
+                        "auto_resume": True,
+                        "resume_after": resume_after,
+                    },
+                    {"$set": {"last_error": error, "updated_at": _now()},
+                     "$unset": {"auto_resume": ""}},
+                )
+                await _write_log(config, "recovery_failed", reason="FloodWait", error=error)
+                log.error("Auto-rotation %s FloodWait recovery not resumed: %s", key, error)
+                return
+
+            if await _is_duplicate(config):
+                error = "An identical rotation configuration already exists."
+                await _collection().update_one(
+                    {
+                        "_id": config_id,
+                        "status": "paused",
+                        "auto_resume": True,
+                        "resume_after": resume_after,
+                    },
+                    {"$set": {"last_error": error, "updated_at": _now()},
+                     "$unset": {"auto_resume": ""}},
+                )
+                await _write_log(config, "recovery_failed", reason="FloodWait", error=error)
+                log.error("Auto-rotation %s FloodWait recovery not resumed: %s", key, error)
+                return
+
+            result = await _collection().update_one(
+                {
+                    "_id": config_id,
+                    "status": "paused",
+                    "auto_resume": True,
+                    "resume_after": resume_after,
+                },
+                {"$set": {
+                    "status": "running",
+                    "updated_at": _now(),
+                    "last_error": None,
+                }, "$unset": {"auto_resume": "", "resume_after": ""}},
+            )
+            if not result.matched_count:
+                log.info("Auto-rotation %s FloodWait recovery skipped; configuration changed", key)
+                return
+
+            config.update({"status": "running", "auto_resume": False})
+            if not _ensure_job(config, bot):
+                log.info("Auto-rotation %s FloodWait recovery continued its existing scheduler job", key)
+            current = await _collection().find_one({"_id": config_id}, {"status": 1})
+            if current and current.get("status") != "running":
+                await _cancel_job(config_id)
+                log.info("Auto-rotation %s remained paused after FloodWait recovery", key)
+                return
+
+            await _write_log(config, "resumed", reason="FloodWait", resume_after=resume_after)
+            log.info("Auto-rotation %s resumed after FloodWait at %s", key, _now().isoformat())
+            return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Auto-rotation %s FloodWait recovery failed", key)
+    finally:
+        if _recovery_jobs.get(key) is asyncio.current_task():
+            _recovery_jobs.pop(key, None)
+
+
+def _ensure_recovery_job(config: dict, bot) -> bool:
+    key = _config_key(config["_id"])
+    existing = _recovery_jobs.get(key)
+    if existing and not existing.done():
+        return False
+    _recovery_jobs[key] = asyncio.create_task(
+        _recover_after_floodwait(config["_id"], bot),
+        name=f"autorotate-recovery-{key}",
+    )
+    return True
 
 
 async def _validate_for_start(config: dict, test_mode: bool) -> str | None:
@@ -594,7 +751,11 @@ async def start_config(config_id: str, bot, test_mode: bool = False) -> tuple[bo
         })
     if mode_changed or not has_pending_cycle:
         updates["next_run_at"] = _now()
-    await _collection().update_one({"_id": object_id}, {"$set": updates, "$unset": {"resume_after": ""}})
+    await _collection().update_one(
+        {"_id": object_id},
+        {"$set": updates, "$unset": {"resume_after": "", "auto_resume": ""}},
+    )
+    await _cancel_recovery_job(object_id)
     config.update(updates)
     if not _ensure_job(config, bot):
         return False, "A scheduler job for this configuration is already running."
@@ -606,13 +767,26 @@ async def pause_config(config_id: str) -> bool:
     object_id = parse_config_id(config_id)
     result = await _collection().update_one(
         {"_id": object_id, "status": "running"},
-        {"$set": {"status": "paused", "updated_at": _now()}},
+        {"$set": {"status": "paused", "updated_at": _now()},
+         "$unset": {"auto_resume": ""}},
     )
     if result.modified_count:
         await _cancel_job(object_id)
+        await _cancel_recovery_job(object_id)
         config = await _collection().find_one({"_id": object_id})
         if config:
             await _write_log(config, "paused")
+        return True
+    result = await _collection().update_one(
+        {"_id": object_id, "status": "paused", "auto_resume": True},
+        {"$set": {"updated_at": _now()}, "$unset": {"auto_resume": ""}},
+    )
+    if result.modified_count:
+        await _cancel_recovery_job(object_id)
+        config = await _collection().find_one({"_id": object_id})
+        if config:
+            await _write_log(config, "paused", reason="manual")
+        log.info("Auto-rotation %s FloodWait recovery cancelled by manual pause", object_id)
         return True
     return False
 
@@ -636,8 +810,9 @@ async def resume_config(config_id: str, bot) -> tuple[bool, str]:
     await _collection().update_one(
         {"_id": object_id},
         {"$set": {"status": "running", "updated_at": _now(), "last_error": None},
-         "$unset": {"resume_after": ""}},
+         "$unset": {"resume_after": "", "auto_resume": ""}},
     )
+    await _cancel_recovery_job(object_id)
     if not _ensure_job(config, bot):
         await _collection().update_one(
             {"_id": object_id},
@@ -658,10 +833,11 @@ async def stop_config(config_id: str) -> bool:
         {"$set": {
             "status": "stopped",
             "updated_at": _now(),
-        }},
+        }, "$unset": {"auto_resume": ""}},
         upsert=False,
     )
     await _cancel_job(object_id)
+    await _cancel_recovery_job(object_id)
     await _write_log(config, "stopped")
     return True
 
@@ -669,6 +845,7 @@ async def stop_config(config_id: str) -> bool:
 async def delete_config(config_id: str) -> bool:
     object_id = parse_config_id(config_id)
     await _cancel_job(object_id)
+    await _cancel_recovery_job(object_id)
     result = await _collection().delete_one({"_id": object_id})
     return result.deleted_count > 0
 
@@ -691,12 +868,29 @@ async def restore_running_configs(bot) -> int:
         if _ensure_job(config, bot):
             restored += 1
             log.info("Restored auto-rotation configuration %s", config["_id"])
+    pending_recoveries = await _collection().find(
+        {"status": "paused", "auto_resume": True}
+    ).to_list(None)
+    for config in pending_recoveries:
+        if not _to_datetime(config.get("resume_after")):
+            log.error(
+                "Auto-rotation %s has FloodWait recovery enabled without a valid resume time",
+                config["_id"],
+            )
+            continue
+        if _ensure_recovery_job(config, bot):
+            log.info(
+                "Restored Auto-rotation %s FloodWait recovery for %s",
+                config["_id"],
+                _to_datetime(config["resume_after"]).isoformat(),
+            )
     return restored
 
 
 async def shutdown() -> None:
-    tasks = list(_jobs.values())
+    tasks = list(_jobs.values()) + list(_recovery_jobs.values())
     _jobs.clear()
+    _recovery_jobs.clear()
     for task in tasks:
         if not task.done():
             task.cancel()
