@@ -583,6 +583,214 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed["last_message_id"], second["_id"])
         self.assertNotIn("pending_message_id", completed)
 
+    async def test_slowmode_wait_retries_only_affected_groups_at_exact_deadlines(self):
+        first = {"_id": ObjectId(), "type": "text", "text": "first"}
+        second = {"_id": ObjectId(), "type": "text", "text": "second"}
+        await self.db.messages.insert_one(first)
+        await self.db.messages.insert_one(second)
+        await self.db.groups.insert_one({"chat_id": 101, "title": "One"})
+        await self.db.groups.insert_one({"chat_id": 202, "title": "Two"})
+        config = await autorotate.create_config("slowmode-recovery")
+        await autorotate.edit_config(
+            str(config["_id"]),
+            {
+                "group_ids": [101, 202],
+                "message_ids": [first["_id"], second["_id"]],
+                "interval_seconds": 20,
+            },
+            reset_rotation=True,
+        )
+        await self.db.autorotate_configs.update_one(
+            {"_id": config["_id"]},
+            {"$set": {"status": "running"}},
+        )
+        current_time = [autorotate._now()]
+        attempts = []
+        slowmode_attempts = {101: 0, 202: 0}
+        original_sleep = asyncio.sleep
+
+        class FakeSlowmodeWait(Exception):
+            def __init__(self, value):
+                self.value = value
+
+        async def send_with_slowmode(bot, chat_id, message):
+            attempts.append((chat_id, current_time[0]))
+            slowmode_attempts[chat_id] += 1
+            if slowmode_attempts[chat_id] == 1:
+                raise FakeSlowmodeWait({101: 5, 202: 2}[chat_id])
+
+        async def advance_time(delay):
+            current_time[0] += autorotate.timedelta(seconds=delay)
+            await original_sleep(0)
+
+        with (
+            patch.object(autorotate, "SlowmodeWait", FakeSlowmodeWait),
+            patch.object(autorotate, "_send_group", new=send_with_slowmode),
+            patch.object(autorotate, "_now", side_effect=lambda: current_time[0]),
+            patch.object(autorotate.asyncio, "sleep", new=advance_time),
+        ):
+            config = await autorotate.get_config(str(config["_id"]))
+            await autorotate._run_group_cycle(
+                config, object(), [first, second]
+            )
+
+        start = attempts[0][1]
+        self.assertEqual(
+            attempts,
+            [
+                (101, start),
+                (202, start),
+                (202, start + autorotate.timedelta(seconds=2)),
+                (101, start + autorotate.timedelta(seconds=5)),
+            ],
+        )
+        completed = await autorotate.get_config(str(config["_id"]))
+        self.assertEqual(completed["status"], "running")
+        self.assertEqual(completed["interval_seconds"], 20)
+        self.assertEqual(completed["next_message_index"], 1)
+        self.assertNotIn("pending_message_id", completed)
+        sent_events = [
+            event for event in self.db.promotion_logs.documents
+            if event.get("action") == "group_sent"
+        ]
+        self.assertCountEqual(
+            [event["chat_id"] for event in sent_events],
+            [101, 202],
+        )
+
+    async def test_pending_slowmode_retry_restores_after_restart(self):
+        first = {"_id": ObjectId(), "type": "text", "text": "first"}
+        second = {"_id": ObjectId(), "type": "text", "text": "second"}
+        await self.db.messages.insert_one(first)
+        await self.db.messages.insert_one(second)
+        await self.db.groups.insert_one({"chat_id": 101, "title": "One"})
+        await self.db.groups.insert_one({"chat_id": 202, "title": "Two"})
+        config = await autorotate.create_config("slowmode-restart")
+        await autorotate.edit_config(
+            str(config["_id"]),
+            {
+                "group_ids": [101, 202],
+                "message_ids": [first["_id"], second["_id"]],
+            },
+            reset_rotation=True,
+        )
+        current_time = [autorotate._now()]
+        deadline = current_time[0] + autorotate.timedelta(seconds=8)
+        await self.db.autorotate_configs.update_one(
+            {"_id": config["_id"]},
+            {"$set": {
+                "status": "running",
+                "next_message_index": 1,
+                "last_message_id": first["_id"],
+                "pending_message_id": second["_id"],
+                "pending_message_index": 1,
+                "pending_group_ids": [101, 202],
+                "pending_completed_group_ids": [101],
+                "pending_group_retry_after": {"202": deadline},
+                "next_run_at": current_time[0],
+            }},
+        )
+        attempts = []
+        original_sleep = asyncio.sleep
+        job_started = asyncio.Event()
+        continue_job = asyncio.Event()
+
+        async def advance_time(delay):
+            current_time[0] += autorotate.timedelta(seconds=delay)
+            await original_sleep(0)
+
+        async def run_restored_cycle(config_id, bot):
+            job_started.set()
+            await continue_job.wait()
+            restored_config = await autorotate.get_config(str(config_id))
+            messages = await autorotate._load_selected_messages(restored_config)
+            await autorotate._run_group_cycle(restored_config, bot, messages)
+            await self.db.autorotate_configs.update_one(
+                {"_id": config_id},
+                {"$set": {"status": "stopped"}},
+            )
+
+        async def record_send(bot, chat_id, message):
+            attempts.append((chat_id, current_time[0], message["_id"]))
+
+        with (
+            patch.object(autorotate, "_now", side_effect=lambda: current_time[0]),
+            patch.object(autorotate.asyncio, "sleep", new=advance_time),
+            patch.object(autorotate, "_send_group", new=record_send),
+            patch.object(autorotate, "_run_config", new=run_restored_cycle),
+        ):
+            self.assertEqual(await autorotate.restore_running_configs(object()), 1)
+            await job_started.wait()
+            self.assertEqual(await autorotate.restore_running_configs(object()), 0)
+            task = autorotate._jobs[str(config["_id"])]
+            continue_job.set()
+            await task
+
+        self.assertEqual(
+            attempts,
+            [(202, deadline, second["_id"])],
+        )
+        restored = await autorotate.get_config(str(config["_id"]))
+        self.assertEqual(restored["status"], "stopped")
+        self.assertEqual(restored["last_message_id"], second["_id"])
+        self.assertEqual(restored["next_message_index"], 0)
+
+    async def test_manual_pause_and_stop_prevent_slowmode_retries(self):
+        original_sleep = asyncio.sleep
+
+        class FakeSlowmodeWait(Exception):
+            value = 12
+
+        for action in ("pause", "stop"):
+            config = await self._new_valid_config(
+                f"slowmode-manual-{action}",
+                chat_id=101 if action == "pause" else 202,
+            )
+            chat_id = config["group_ids"][0]
+            await self.db.autorotate_configs.update_one(
+                {"_id": config["_id"]},
+                {"$set": {"status": "running"}},
+            )
+            sleep_started = asyncio.Event()
+            release_sleep = asyncio.Event()
+            attempts = []
+
+            async def block_until_released(delay):
+                self.assertGreater(delay, 11)
+                self.assertLessEqual(delay, 12)
+                sleep_started.set()
+                await release_sleep.wait()
+                await original_sleep(0)
+
+            async def send_with_slowmode(bot, target_chat_id, message):
+                attempts.append(target_chat_id)
+                raise FakeSlowmodeWait()
+
+            with (
+                patch.object(autorotate, "SlowmodeWait", FakeSlowmodeWait),
+                patch.object(autorotate, "_send_group", new=send_with_slowmode),
+                patch.object(autorotate.asyncio, "sleep", new=block_until_released),
+            ):
+                task = asyncio.create_task(
+                    autorotate._run_group_cycle(
+                        config, object(), await autorotate._load_selected_messages(config)
+                    )
+                )
+                await asyncio.wait_for(sleep_started.wait(), timeout=2)
+                if action == "pause":
+                    self.assertTrue(await autorotate.pause_config(str(config["_id"])))
+                else:
+                    self.assertTrue(await autorotate.stop_config(str(config["_id"])))
+                release_sleep.set()
+                await task
+
+            self.assertEqual(attempts, [chat_id])
+            persisted = await autorotate.get_config(str(config["_id"]))
+            self.assertEqual(
+                persisted["status"],
+                "paused" if action == "pause" else "stopped",
+            )
+
     async def test_configs_persist_independently_and_schedule_once(self):
         first = await self._new_valid_config("first", chat_id=101)
         second = await self._new_valid_config("second", chat_id=202)

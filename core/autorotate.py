@@ -145,6 +145,7 @@ async def edit_config(config_id: str, updates: dict, reset_rotation: bool = Fals
             "pending_message_id": 1,
             "pending_group_ids": 1,
             "pending_completed_group_ids": 1,
+            "pending_group_retry_after": 1,
             "last_message_id": 1,
         },
     )
@@ -162,6 +163,7 @@ async def edit_config(config_id: str, updates: dict, reset_rotation: bool = Fals
             "pending_message_id": "",
             "pending_group_ids": "",
             "pending_message_index": "",
+            "pending_group_retry_after": "",
         }
     elif "group_ids" in updates and config.get("pending_message_id") is not None:
         next_group_ids = updates["group_ids"]
@@ -171,6 +173,11 @@ async def edit_config(config_id: str, updates: dict, reset_rotation: bool = Fals
             for chat_id in config.get("pending_completed_group_ids", [])
             if chat_id in next_group_ids
         ]
+        fields["pending_group_retry_after"] = {
+            str(chat_id): retry_after
+            for chat_id, retry_after in config.get("pending_group_retry_after", {}).items()
+            if int(chat_id) in next_group_ids
+        }
     result = await _collection().update_one(
         {"_id": object_id, "status": {"$ne": "running"}},
         update,
@@ -297,6 +304,35 @@ async def _send_group(bot, chat_id: int, message: dict) -> None:
             raise
 
 
+async def _persist_group_slowmode_retry(
+    config_id: ObjectId, chat_id: int, retry_after: datetime
+) -> bool:
+    config = await _collection().find_one({"_id": config_id, "status": "running"})
+    if not config:
+        return False
+    retries = dict(config.get("pending_group_retry_after", {}))
+    retries[str(chat_id)] = retry_after
+    result = await _collection().update_one(
+        {"_id": config_id, "status": "running"},
+        {"$set": {"pending_group_retry_after": retries, "updated_at": _now()}},
+    )
+    return bool(result.matched_count)
+
+
+async def _clear_group_slowmode_retry(config_id: ObjectId, chat_id: int) -> None:
+    config = await _collection().find_one({"_id": config_id})
+    if not config:
+        return
+    retries = dict(config.get("pending_group_retry_after", {}))
+    if str(chat_id) not in retries:
+        return
+    retries.pop(str(chat_id))
+    await _collection().update_one(
+        {"_id": config_id},
+        {"$set": {"pending_group_retry_after": retries}},
+    )
+
+
 async def _mark_group_complete(config_id: ObjectId, chat_id: int) -> None:
     await _collection().update_one(
         {"_id": config_id},
@@ -320,6 +356,11 @@ async def _remove_unavailable_group(
         fields["pending_completed_group_ids"] = [
             item for item in current.get("pending_completed_group_ids", []) if item != chat_id
         ]
+        fields["pending_group_retry_after"] = {
+            key: value
+            for key, value in current.get("pending_group_retry_after", {}).items()
+            if key != str(chat_id)
+        }
     await _collection().update_one(
         {"_id": config["_id"]},
         {"$set": fields},
@@ -417,6 +458,7 @@ async def _finish_cycle(config: dict, message: dict, selected_index: int) -> int
                 "pending_group_ids": "",
                 "pending_completed_group_ids": "",
                 "pending_message_index": "",
+                "pending_group_retry_after": "",
             },
         },
     )
@@ -473,6 +515,7 @@ async def _run_group_cycle(config: dict, bot, messages: list[dict]) -> int:
         )
 
     completed = set(config.get("pending_completed_group_ids", []))
+    retry_after_by_group = dict(config.get("pending_group_retry_after", {}))
     groups = await db.groups.find({"chat_id": {"$in": pending_groups}}).to_list(len(pending_groups))
     group_by_id = {group["chat_id"]: group for group in groups}
     inactive_docs = await db.inactive_groups.find(
@@ -484,28 +527,32 @@ async def _run_group_cycle(config: dict, bot, messages: list[dict]) -> int:
     ).to_list(len(pending_groups))
     blacklisted = {doc["chat_id"] for doc in blacklist_docs}
 
-    for chat_id in pending_groups:
-        if chat_id in completed:
-            continue
-        if chat_id not in group_by_id:
-            error = "Group is missing from the synced group list."
-            await _remove_unavailable_group(config, chat_id, error)
-            await _mark_group_complete(config_id, chat_id)
-            continue
-        if chat_id in inactive or chat_id in blacklisted:
-            error = "Group is inactive or blacklisted."
-            await _write_log(config, "group_skipped", chat_id=chat_id, error=error)
-            await _mark_group_complete(config_id, chat_id)
-            continue
-
+    async def deliver_group(chat_id: int) -> str:
         try:
             await _send_group(bot, chat_id, message)
         except FloodWait as exc:
             await _pause_after_wait(config, int(exc.value), "FloodWait", bot)
-            return 0
+            return "floodwait"
         except SlowmodeWait as exc:
-            await _pause_after_wait(config, int(exc.value), "SlowmodeWait")
-            return 0
+            wait_seconds = int(exc.value)
+            retry_after = _now() + timedelta(seconds=wait_seconds)
+            if not await _persist_group_slowmode_retry(config_id, chat_id, retry_after):
+                return "stopped"
+            retry_after_by_group[str(chat_id)] = retry_after
+            await _write_log(
+                config,
+                "group_slowmode_wait",
+                chat_id=chat_id,
+                wait_seconds=wait_seconds,
+                retry_after=retry_after,
+            )
+            log.info(
+                "Auto-rotation %s waiting %ss before retrying group %s",
+                config_id,
+                wait_seconds,
+                chat_id,
+            )
+            return "slowmode"
         except _PERMANENT_GROUP_ERRORS as exc:
             error = f"{type(exc).__name__}: {exc}"
             await _remove_unavailable_group(
@@ -514,24 +561,69 @@ async def _run_group_cycle(config: dict, bot, messages: list[dict]) -> int:
                 error,
                 group_by_id[chat_id].get("title", ""),
             )
-            await _mark_group_complete(config_id, chat_id)
-            continue
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             await _write_log(config, "group_error", chat_id=chat_id, error=error)
             log.exception("Auto-rotation %s failed for group %s", config_id, chat_id)
-            await _mark_group_complete(config_id, chat_id)
-            continue
-
-        await _write_log(
-            config,
-            "group_sent",
-            chat_id=chat_id,
-            group_title=group_by_id[chat_id].get("title", ""),
-            message_id=str(message["_id"]),
-        )
-        log.info("Auto-rotation %s sent message to group %s", config_id, chat_id)
+        else:
+            await _write_log(
+                config,
+                "group_sent",
+                chat_id=chat_id,
+                group_title=group_by_id[chat_id].get("title", ""),
+                message_id=str(message["_id"]),
+            )
+            log.info("Auto-rotation %s sent message to group %s", config_id, chat_id)
+        await _clear_group_slowmode_retry(config_id, chat_id)
         await _mark_group_complete(config_id, chat_id)
+        completed.add(chat_id)
+        return "complete"
+
+    for chat_id in pending_groups:
+        if chat_id in completed:
+            continue
+        if chat_id not in group_by_id:
+            error = "Group is missing from the synced group list."
+            await _remove_unavailable_group(config, chat_id, error)
+            await _mark_group_complete(config_id, chat_id)
+            completed.add(chat_id)
+            continue
+        if chat_id in inactive or chat_id in blacklisted:
+            error = "Group is inactive or blacklisted."
+            await _write_log(config, "group_skipped", chat_id=chat_id, error=error)
+            await _mark_group_complete(config_id, chat_id)
+            completed.add(chat_id)
+            continue
+        retry_after = _to_datetime(retry_after_by_group.get(str(chat_id)))
+        if retry_after and retry_after > _now():
+            continue
+        outcome = await deliver_group(chat_id)
+        if outcome in {"floodwait", "stopped"}:
+            return 0
+
+    while True:
+        pending_retries = [
+            (chat_id, _to_datetime(retry_after_by_group.get(str(chat_id))))
+            for chat_id in pending_groups
+            if chat_id not in completed
+            and _to_datetime(retry_after_by_group.get(str(chat_id))) is not None
+        ]
+        if not pending_retries:
+            break
+        next_retry = min(retry_after for _, retry_after in pending_retries)
+        delay = (next_retry - _now()).total_seconds()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        current = await _collection().find_one({"_id": config_id}, {"status": 1})
+        if not current or current.get("status") != "running":
+            return 0
+        now = _now()
+        for chat_id, retry_after in pending_retries:
+            if retry_after > now:
+                continue
+            outcome = await deliver_group(chat_id)
+            if outcome in {"floodwait", "stopped"}:
+                return 0
 
     interval = await _finish_cycle(config, message, message_index)
     current = await _collection().find_one({"_id": config_id}, {"group_ids": 1})
@@ -840,6 +932,7 @@ async def start_config(config_id: str, bot, test_mode: bool = False) -> tuple[bo
         })
     if mode_changed or not has_pending_cycle:
         updates["next_run_at"] = _now()
+        updates["pending_group_retry_after"] = {}
     await _collection().update_one(
         {"_id": object_id},
         {"$set": updates, "$unset": {"resume_after": "", "auto_resume": ""}},
