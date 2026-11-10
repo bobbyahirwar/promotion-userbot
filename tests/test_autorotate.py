@@ -365,6 +365,61 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempted, [101, 202])
         self.assertEqual(persisted["next_message_index"], 0)
         self.assertEqual(persisted["last_message_id"], message["_id"])
+        self.assertEqual(persisted["group_ids"], [101, 202])
+
+    async def test_permanent_send_errors_remove_only_the_unavailable_groups(self):
+        message = {"_id": ObjectId(), "type": "text", "text": "saved"}
+        await self.db.messages.insert_one(message)
+        for chat_id in (101, 202, 303):
+            await self.db.groups.insert_one({"chat_id": chat_id, "title": f"Group {chat_id}"})
+        config = await autorotate.create_config("remove-unavailable")
+        await autorotate.edit_config(
+            str(config["_id"]),
+            {"group_ids": [101, 202, 303], "message_ids": [message["_id"]]},
+            reset_rotation=True,
+        )
+        await self.db.autorotate_configs.update_one(
+            {"_id": config["_id"]},
+            {"$set": {"status": "running"}},
+        )
+        errors = {
+            101: autorotate.ChatWriteForbidden(400, "CHAT_WRITE_FORBIDDEN"),
+            202: autorotate.ChannelPrivate(400, "CHANNEL_PRIVATE"),
+        }
+        attempted = []
+
+        async def send_with_permanent_errors(bot, chat_id, saved_message):
+            attempted.append(chat_id)
+            if chat_id in errors:
+                raise errors[chat_id]
+
+        with patch.object(autorotate, "_send_group", new=send_with_permanent_errors):
+            config = await autorotate.get_config(str(config["_id"]))
+            await autorotate._run_group_cycle(config, object(), [message])
+
+        persisted = await autorotate.get_config(str(config["_id"]))
+        removed_logs = await self.db.promotion_logs.find(
+            {"action": "group_removed"}
+        ).to_list(None)
+        self.assertEqual(attempted, [101, 202, 303])
+        self.assertEqual(persisted["group_ids"], [303])
+        self.assertEqual(persisted["status"], "running")
+        self.assertEqual(await self.db.groups.count_documents({}), 3)
+        self.assertEqual({event["chat_id"] for event in removed_logs}, {101, 202})
+
+    async def test_temporary_send_error_does_not_remove_group(self):
+        config = await self._new_valid_config(chat_id=101)
+        config["status"] = "running"
+        message = {"_id": config["message_ids"][0], "type": "text", "text": "saved"}
+
+        async def temporary_failure(bot, chat_id, saved_message):
+            raise TimeoutError("temporary network issue")
+
+        with patch.object(autorotate, "_send_group", new=temporary_failure):
+            await autorotate._run_group_cycle(config, object(), [message])
+
+        persisted = await autorotate.get_config(str(config["_id"]))
+        self.assertEqual(persisted["group_ids"], [101])
 
     async def test_group_cooldown_uses_floodwait_not_old_global_send_gap(self):
         await self.db.state.insert_one({
@@ -850,6 +905,70 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
             (await autorotate.get_config(str(config["_id"])))["status"],
             "running",
         )
+        await autorotate.shutdown()
+
+    async def test_floodwait_during_auto_resume_schedules_another_recovery(self):
+        first = {"_id": ObjectId(), "type": "text", "text": "first"}
+        second = {"_id": ObjectId(), "type": "text", "text": "second"}
+        await self.db.messages.insert_one(first)
+        await self.db.messages.insert_one(second)
+        await self.db.groups.insert_one({"chat_id": 101, "title": "One"})
+        config = await autorotate.create_config("repeated-auto-recovery")
+        await autorotate.edit_config(
+            str(config["_id"]),
+            {"group_ids": [101], "message_ids": [first["_id"], second["_id"]]},
+            reset_rotation=True,
+        )
+        await self.db.autorotate_configs.update_one(
+            {"_id": config["_id"]},
+            {"$set": {
+                "status": "running",
+                "next_message_index": 1,
+                "last_message_id": first["_id"],
+            }},
+        )
+        current_time = [autorotate._now()]
+        original_sleep = asyncio.sleep
+        send_attempts = 0
+
+        async def advance_time(delay):
+            current_time[0] += autorotate.timedelta(seconds=delay)
+            await original_sleep(0)
+
+        async def send_with_second_floodwait(bot, chat_id, message):
+            nonlocal send_attempts
+            send_attempts += 1
+            if send_attempts == 1:
+                raise autorotate.FloodWait(13, "FLOOD_WAIT_X")
+
+        async def run_resumed_cycle(config_id, bot):
+            current = await autorotate.get_config(str(config_id))
+            messages = await autorotate._load_selected_messages(current)
+            await autorotate._run_group_cycle(current, bot, messages)
+            if send_attempts > 1:
+                await self.db.autorotate_configs.update_one(
+                    {"_id": config_id},
+                    {"$set": {"status": "stopped"}},
+                )
+
+        with (
+            patch.object(autorotate, "_now", side_effect=lambda: current_time[0]),
+            patch.object(autorotate.asyncio, "sleep", new=advance_time),
+            patch.object(autorotate, "_send_group", new=send_with_second_floodwait),
+            patch.object(autorotate, "_run_config", new=run_resumed_cycle),
+        ):
+            config = await autorotate.get_config(str(config["_id"]))
+            await autorotate._pause_after_wait(config, 7, "FloodWait", object())
+            key = str(config["_id"])
+            while key in autorotate._recovery_jobs:
+                await autorotate._recovery_jobs[key]
+
+        persisted = await autorotate.get_config(str(config["_id"]))
+        self.assertEqual(send_attempts, 2)
+        self.assertEqual(persisted["status"], "stopped")
+        self.assertEqual(persisted["next_message_index"], 0)
+        self.assertEqual(persisted["last_message_id"], second["_id"])
+        self.assertEqual(current_time[0] - config["updated_at"], autorotate.timedelta(seconds=20))
         await autorotate.shutdown()
 
     async def test_only_one_recovery_job_is_scheduled_per_configuration(self):

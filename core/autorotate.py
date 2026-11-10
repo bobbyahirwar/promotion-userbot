@@ -4,7 +4,18 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
-from pyrogram.errors import FloodWait, SlowmodeWait
+from pyrogram.errors import (
+    ChannelInvalid,
+    ChannelPrivate,
+    ChatAdminRequired,
+    ChatForbidden,
+    ChatIdInvalid,
+    ChatWriteForbidden,
+    FloodWait,
+    PeerIdInvalid,
+    SlowmodeWait,
+    UserBannedInChannel,
+)
 
 from config import OWNER_ID
 from core.promotion import _log_event
@@ -39,6 +50,16 @@ _jobs: dict[str, asyncio.Task] = {}
 _recovery_jobs: dict[str, asyncio.Task] = {}
 _group_send_lock = asyncio.Lock()
 _media_cache: dict[str, bytes] = {}
+_PERMANENT_GROUP_ERRORS = (
+    ChannelInvalid,
+    ChannelPrivate,
+    ChatAdminRequired,
+    ChatForbidden,
+    ChatIdInvalid,
+    ChatWriteForbidden,
+    PeerIdInvalid,
+    UserBannedInChannel,
+)
 
 
 def parse_config_id(value: str) -> ObjectId:
@@ -283,6 +304,41 @@ async def _mark_group_complete(config_id: ObjectId, chat_id: int) -> None:
     )
 
 
+async def _remove_unavailable_group(
+    config: dict, chat_id: int, error: str, group_title: str = ""
+) -> None:
+    current = await _collection().find_one({"_id": config["_id"]})
+    if not current:
+        return
+
+    group_ids = [item for item in current.get("group_ids", []) if item != chat_id]
+    fields = {"group_ids": group_ids, "updated_at": _now()}
+    if current.get("pending_group_ids") is not None:
+        fields["pending_group_ids"] = [
+            item for item in current.get("pending_group_ids", []) if item != chat_id
+        ]
+        fields["pending_completed_group_ids"] = [
+            item for item in current.get("pending_completed_group_ids", []) if item != chat_id
+        ]
+    await _collection().update_one(
+        {"_id": config["_id"]},
+        {"$set": fields},
+    )
+    await _write_log(
+        config,
+        "group_removed",
+        chat_id=chat_id,
+        group_title=group_title,
+        reason=error,
+    )
+    log.warning(
+        "Auto-rotation %s removed group %s from its selection: %s",
+        config["_id"],
+        chat_id,
+        error,
+    )
+
+
 async def _pause_after_wait(config: dict, wait_seconds: int, reason: str, bot=None) -> None:
     now = _now()
     wait_seconds = max(0, int(wait_seconds))
@@ -431,8 +487,13 @@ async def _run_group_cycle(config: dict, bot, messages: list[dict]) -> int:
     for chat_id in pending_groups:
         if chat_id in completed:
             continue
-        if chat_id not in group_by_id or chat_id in inactive or chat_id in blacklisted:
-            error = "Group is no longer available, inactive, or blacklisted."
+        if chat_id not in group_by_id:
+            error = "Group is missing from the synced group list."
+            await _remove_unavailable_group(config, chat_id, error)
+            await _mark_group_complete(config_id, chat_id)
+            continue
+        if chat_id in inactive or chat_id in blacklisted:
+            error = "Group is inactive or blacklisted."
             await _write_log(config, "group_skipped", chat_id=chat_id, error=error)
             await _mark_group_complete(config_id, chat_id)
             continue
@@ -445,6 +506,16 @@ async def _run_group_cycle(config: dict, bot, messages: list[dict]) -> int:
         except SlowmodeWait as exc:
             await _pause_after_wait(config, int(exc.value), "SlowmodeWait")
             return 0
+        except _PERMANENT_GROUP_ERRORS as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            await _remove_unavailable_group(
+                config,
+                chat_id,
+                error,
+                group_by_id[chat_id].get("title", ""),
+            )
+            await _mark_group_complete(config_id, chat_id)
+            continue
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             await _write_log(config, "group_error", chat_id=chat_id, error=error)
@@ -463,6 +534,22 @@ async def _run_group_cycle(config: dict, bot, messages: list[dict]) -> int:
         await _mark_group_complete(config_id, chat_id)
 
     interval = await _finish_cycle(config, message, message_index)
+    current = await _collection().find_one({"_id": config_id}, {"group_ids": 1})
+    if current is not None and not current.get("group_ids"):
+        result = await _collection().update_one(
+            {"_id": config_id, "status": "running", "group_ids": []},
+            {"$set": {
+                "status": "paused",
+                "last_error": "No selected groups remain available for posting.",
+                "updated_at": _now(),
+            }},
+        )
+        if result.matched_count:
+            await _write_log(config, "paused", reason="no_available_groups")
+            log.warning(
+                "Auto-rotation %s paused because no selected groups remain available",
+                config_id,
+            )
     return interval
 
 
@@ -625,6 +712,8 @@ async def _recover_after_floodwait(config_id: ObjectId, bot) -> None:
                 return
 
             config.update({"status": "running", "auto_resume": False})
+            if _recovery_jobs.get(key) is asyncio.current_task():
+                _recovery_jobs.pop(key, None)
             if not _ensure_job(config, bot):
                 log.info("Auto-rotation %s FloodWait recovery continued its existing scheduler job", key)
             current = await _collection().find_one({"_id": config_id}, {"status": 1})
