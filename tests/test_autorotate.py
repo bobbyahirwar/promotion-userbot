@@ -26,6 +26,7 @@ os.environ.update({
 from bson import ObjectId
 
 from core import autorotate
+from core.account_context import account_context
 from handlers.autorotate import _parse_selection
 
 if _IMPORT_LOOP:
@@ -152,6 +153,8 @@ class FakeDatabase:
 
 class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.account_scope = account_context(1)
+        self.account_scope.__enter__()
         self.db = FakeDatabase()
         self.database_patch = patch.object(autorotate, "get_db", return_value=self.db)
         self.database_patch.start()
@@ -164,6 +167,7 @@ class AutoRotateTests(unittest.IsolatedAsyncioTestCase):
         await autorotate.shutdown()
         self.log_patch.stop()
         self.database_patch.stop()
+        self.account_scope.__exit__(None, None, None)
 
     async def _log_event(self, db, event):
         await db.promotion_logs.insert_one(event)

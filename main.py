@@ -33,19 +33,21 @@ threading.Thread(target=_run_flask, daemon=True).start()
 
 async def main():
     from core.bot import bot_app
-    from core.userbot import userbot
-    from database import init_db, get_db
-    from handlers import admin, messages, groups, promo, blacklist, stats, inactive_groups
+    from core.accounts import account_manager
+    from core.account_context import account_context
+    from database import init_db
+    from handlers import accounts, admin, messages, groups, promo, blacklist, stats, inactive_groups
     from handlers import autorotate as autorotate_handler
     import handlers.sync_groups as sync_groups_mod
     import handlers.health as health_mod
-    from core import autorotate
+    from core import autorotate, promotion
     from handlers.groups import validate_and_clean_groups
     from handlers.sync_groups import sync_joined_groups
     from core.promotion import restore_state
     from core.uptime import set_start_time
 
     # Register handlers
+    accounts.register(bot_app)
     admin.register(bot_app)
     messages.register(bot_app)
     groups.register(bot_app)
@@ -67,95 +69,50 @@ async def main():
         print(f"❌ Bot failed to connect: {e}")
         sys.exit(1)
 
-    # Start Pyrogram User Session
+    # Connect MongoDB
+    await init_db()
+
     try:
-        await userbot.start()
-        print("✅ User Session Connected")
-    except Exception as e:
-        print(f"❌ User Session failed to connect: {e}")
+        await account_manager.startup()
+    except RuntimeError as exc:
+        print(f"❌ Account security configuration error: {exc}")
         await bot_app.updater.stop()
         await bot_app.stop()
         await bot_app.shutdown()
         sys.exit(1)
 
-    # Connect MongoDB
-    await init_db()
-
-    # ── Account-change detection ──────────────────────────────────────────────
-    # If the SESSION_STRING belongs to a different Telegram account than the
-    # one stored in MongoDB, all previous group data is stale — clear it and
-    # start fresh before syncing.
-    db = get_db()
-    me = await userbot.get_me()
-    current_user_id = me.id
-
-    stored_doc = await db.state.find_one({"key": "account_user_id"})
-    stored_user_id = stored_doc["value"] if stored_doc else None
-
-    if stored_user_id is not None and stored_user_id != current_user_id:
-        print(
-            f"⚠️  Userbot account changed "
-            f"({stored_user_id} → {current_user_id}). "
-            f"Clearing stale data…"
-        )
-        await db.groups.delete_many({})
-        await db.inactive_groups.delete_many({})
-        await db.stats.delete_many(
-            {"key": {"$in": ["total_sent", "total_failed", "last_promotion_time"]}}
-        )
-        await db.autorotate_configs.update_many(
-            {"status": "running"},
-            {"$set": {
-                "status": "paused",
-                "last_error": "Userbot account changed; review selected groups before resuming.",
-            }},
-        )
-        await db.autorotate_configs.update_many(
-            {"auto_resume": True},
-            {"$set": {
-                "last_error": "Userbot account changed; review selected groups before resuming.",
-                "updated_at": autorotate._now(),
-            }, "$unset": {"auto_resume": ""}},
-        )
-        print("✅ Stale groups, inactive list, and stats cleared.")
-
-    # Persist the current account ID so future startups can detect a change.
-    await db.state.update_one(
-        {"key": "account_user_id"},
-        {"$set": {"value": current_user_id}},
-        upsert=True,
-    )
-
-    # ── Sync joined groups from Telegram ─────────────────────────────────────
-    # Upserts every group/supergroup the userbot is a member of.  New groups
-    # are added; existing ones have their title/username refreshed.  This
-    # runs on every startup so the DB stays in sync with reality.
-    print("🔄 Syncing joined groups from Telegram…")
-    sync_total, sync_added, sync_updated, sync_skipped, sync_reactivated = await sync_joined_groups()
-    print(
-        f"✅ Group sync done — "
-        f"{sync_added} added, {sync_updated} updated, "
-        f"{sync_reactivated} reactivated, "
-        f"{sync_skipped} skipped ({sync_total} dialogs total)"
-    )
-
-    # Validate stored groups — remove any that are permanently inaccessible.
-    # This runs once per startup and never crashes the bot, even if every
-    # stored group is invalid.
-    print("🔍 Validating stored groups...")
-    kept, removed = await validate_and_clean_groups()
-    print(f"✅ Groups validated: {kept} kept, {removed} removed.")
-
-    # Record the moment all services are ready (used by /health uptime)
     set_start_time()
 
-    # Resume promotion if it was running before restart
-    await restore_state(bot_app.bot)
+    account_records = await account_manager.list_accounts()
+    for record in account_records:
+        account_id = int(record["account_id"])
+        client = account_manager.clients.get(account_id)
+        if not client or not client.is_connected:
+            print(f"⚠️ Account {account_id} is disconnected; other accounts remain available.")
+            continue
+        try:
+            with account_context(account_id):
+                print(f"🔄 Syncing groups for account {account_id}…")
+                total, added, updated, skipped, reactivated = await sync_joined_groups()
+                print(
+                    f"✅ Account {account_id} group sync — {added} added, {updated} updated, "
+                    f"{reactivated} reactivated, {skipped} skipped ({total} dialogs)"
+                )
+                kept, removed = await validate_and_clean_groups()
+                print(
+                    f"✅ Account {account_id} groups validated: {kept} kept, {removed} removed."
+                )
+                await restore_state(bot_app.bot, account_id)
+                restored = await autorotate.restore_running_configs(bot_app.bot)
+                print(f"✅ Account {account_id} AutoRotate configurations restored: {restored}")
+        except Exception as exc:
+            print(
+                f"❌ Startup initialization failed for account {account_id} "
+                f"({type(exc).__name__}); other accounts continue."
+            )
 
-    # Restore owner-configured message rotations after group synchronization and
-    # validation so only currently available, explicitly selected groups run.
-    restored_rotations = await autorotate.restore_running_configs(bot_app.bot)
-    print(f"✅ Auto-rotation configurations restored: {restored_rotations}")
+    if not account_records:
+        print("ℹ️ No Telegram accounts configured. Use /start in the control bot to add one.")
 
     print("✅ Promotion System Ready")
 
@@ -164,10 +121,11 @@ async def main():
         await asyncio.Event().wait()
     finally:
         await autorotate.shutdown()
+        await promotion.shutdown()
+        await account_manager.shutdown()
         await bot_app.updater.stop()
         await bot_app.stop()
         await bot_app.shutdown()
-        await userbot.stop()
 
 
 if __name__ == "__main__":

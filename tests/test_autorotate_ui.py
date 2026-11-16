@@ -218,6 +218,31 @@ class InlineAutoRotateTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(query.answer.await_args.kwargs["show_alert"])
         self.assertIn("Only the bot owner", query.answer.await_args.kwargs["text"])
 
+    async def test_draft_from_previous_account_cannot_be_applied_to_selected_account(self):
+        ui._ui_drafts[1] = {
+            "account_id": 101,
+            "mode": "edit_groups",
+            "config_id": "account-one-config",
+            "group_ids": [101],
+            "message_ids": [],
+        }
+        query = SimpleNamespace(
+            id="account-switch",
+            data="ar:gn:0",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            from_user=SimpleNamespace(id=1),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=1),
+        )
+        with patch.object(ui.account_manager, "selected_account_id", 202):
+            await ui.callback_autorotate(update, SimpleNamespace())
+        self.assertNotIn(1, ui._ui_drafts)
+        self.assertTrue(query.answer.await_args.kwargs["show_alert"])
+        self.assertIn("selected account changed", query.answer.await_args.kwargs["text"])
+
     async def test_interval_button_updates_new_draft_before_confirmation(self):
         draft = {
             "mode": "new",

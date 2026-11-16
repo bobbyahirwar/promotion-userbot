@@ -1,5 +1,6 @@
 import asyncio
 import io
+import logging
 import random
 from datetime import datetime, timedelta, timezone
 
@@ -44,9 +45,11 @@ from config import (
 )
 from database import get_db
 from core.userbot import userbot
+from core.account_context import account_context, current_account_id
 
-_task: asyncio.Task = None
-_running: bool = False
+_tasks: dict[int, asyncio.Task] = {}
+_running: dict[int, bool] = {}
+log = logging.getLogger(__name__)
 
 _DECORATIVE_SYMBOLS = tuple("™®©=∆×÷π•|`~¥^°{}%✓<>*\"':;!?/)(+-&_#@")
 
@@ -594,14 +597,30 @@ async def _clear_promotion_rest(db):
 
 # ── Promotion loop ────────────────────────────────────────────────────────────
 
-async def _loop(bot):
-    global _running
+async def _loop(bot, account_id: int):
+    try:
+        await _run_account_loop(bot, account_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Promotion loop failed for account %s.", account_id)
+        _running[account_id] = False
+        with account_context(account_id):
+            db = get_db()
+            await db.state.update_one(
+                {"key": "promotion_running"},
+                {"$set": {"value": False}},
+                upsert=True,
+            )
+
+
+async def _run_account_loop(bot, account_id: int):
 
     print("✅ Promotion Started")
     db = get_db()
     await _start_continuous_runtime(db)
 
-    while _running:
+    while _running.get(account_id, False):
         cycle_start = asyncio.get_event_loop().time()
         db = get_db()
 
@@ -612,10 +631,10 @@ async def _loop(bot):
             if remaining > 0:
                 print(f"Promotion rest started until: {rest_until.isoformat()}")
                 await _pause_continuous_runtime(db)
-                while _running and remaining > 0:
+                while _running.get(account_id, False) and remaining > 0:
                     await asyncio.sleep(remaining)
                     remaining = (rest_until - datetime.now(timezone.utc)).total_seconds()
-                if not _running:
+                if not _running.get(account_id, False):
                     break
             await _clear_promotion_rest(db)
             await _reset_continuous_runtime(db)
@@ -641,10 +660,10 @@ async def _loop(bot):
             if remaining > 0:
                 await _pause_continuous_runtime(db)
                 print(f"⏳ Long FloodWait active — waiting {remaining:.1f}s before resuming")
-                while _running and remaining > 0:
+                while _running.get(account_id, False) and remaining > 0:
                     await asyncio.sleep(min(remaining, 5.0))
                     remaining = (long_floodwait_until - datetime.now(timezone.utc)).total_seconds()
-                if not _running:
+                if not _running.get(account_id, False):
                     break
                 await _start_continuous_runtime(db)
             await _clear_long_floodwait_pause(db)
@@ -660,10 +679,10 @@ async def _loop(bot):
                 reason_doc = cooldown_state.get("reason") if cooldown_state else None
                 reason_val = reason_doc.get("value") if isinstance(reason_doc, dict) else str(reason_doc or "cooldown")
                 print(f"⏳ Promotion {reason_val} active — waiting {remaining:.1f}s before resuming normal cycle")
-                while _running and remaining > 0:
+                while _running.get(account_id, False) and remaining > 0:
                     await asyncio.sleep(min(remaining, 5.0))
                     remaining = await _get_cooldown_remaining_seconds(db)
-                if not _running:
+                if not _running.get(account_id, False):
                     break
                 await _start_continuous_runtime(db)
             await _clear_cooldown(db)
@@ -780,7 +799,7 @@ async def _loop(bot):
             })
 
         for i in range(group_cursor, total_groups):
-            if not _running:
+            if not _running.get(account_id, False):
                 break
 
             group = active_groups[i]
@@ -1078,7 +1097,7 @@ async def _loop(bot):
             # This delay is intentionally placed only between actual promotion
             # sends, not between owner/debug notifications. It does not affect
             # the 10-minute cycle cadence logic at the end of the cycle.
-            if _running and i < total_groups - 1:
+            if _running.get(account_id, False) and i < total_groups - 1:
                 wait_seconds = random.uniform(
                     PROMOTION_MIN_DELAY_SECONDS,
                     PROMOTION_MAX_DELAY_SECONDS,
@@ -1092,7 +1111,7 @@ async def _loop(bot):
             print("⏳ Cooldown triggered — current cycle stopped safely before remaining groups")
             continue
 
-        if not _running:
+        if not _running.get(account_id, False):
             break
 
         # ── End-of-cycle summary ─────────────────────────────────────────────
@@ -1137,7 +1156,7 @@ async def _loop(bot):
             # loop will remain stopped until the operator intervenes or the system is
             # reset; the existing cooldown logic is not used here to avoid altering
             # the established safety layering.
-            _running = False
+            _running[account_id] = False
             await db.state.update_one(
                 {"key": "promotion_running"},
                 {"$set": {"value": False}},
@@ -1215,72 +1234,114 @@ async def _loop(bot):
             "deactivated": deactivated,
         })
 
-        if _running and remaining > 0:
+        if _running.get(account_id, False) and remaining > 0:
             print(f"⏳ Next cycle in {remaining:.0f}s.")
             await asyncio.sleep(remaining)
 
-    _running = False
+    _running[account_id] = False
     print("🔴 Promotion Stopped")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-async def start_promotion(bot):
-    global _running, _task
-    if _running and _task is not None and not _task.done():
+def _resolve_account_id(account_id: int | None = None) -> int:
+    if account_id is not None:
+        return int(account_id)
+    account_id = current_account_id()
+    if account_id is None:
+        from core.accounts import account_manager
+
+        account_id = account_manager.selected_account_id
+    if account_id is None:
+        raise RuntimeError("No Telegram account is selected.")
+    return int(account_id)
+
+
+async def start_promotion(bot, account_id: int | None = None):
+    account_id = _resolve_account_id(account_id)
+    task = _tasks.get(account_id)
+    if _running.get(account_id, False) and task is not None and not task.done():
         return
-    _running = True
-    db = get_db()
-    await db.state.update_one(
-        {"key": "promotion_running"},
-        {"$set": {"value": True}},
-        upsert=True,
-    )
-    _task = asyncio.create_task(_loop(bot))
+    _running[account_id] = True
+    with account_context(account_id):
+        db = get_db()
+        await db.state.update_one(
+            {"key": "promotion_running"},
+            {"$set": {"value": True}},
+            upsert=True,
+        )
+        _tasks[account_id] = asyncio.create_task(_loop(bot, account_id))
 
 
-async def stop_promotion():
-    global _running, _task
-    _running = False
-    db = get_db()
-    await db.state.update_one(
-        {"key": "promotion_running"},
-        {"$set": {"value": False}},
-        upsert=True,
-    )
-    await db.state.delete_many({
-        "key": {
-            "$in": [
-                "promotion_group_cursor",
-                "promotion_cycle_stats",
-                "promotion_continuous_runtime_seconds",
-                "promotion_continuous_runtime_active_since",
-                "promotion_rest_until",
-            ]
-        }
-    })
-    if _task and not _task.done():
-        _task.cancel()
+async def stop_promotion(
+    account_id: int | None = None,
+    preserve_state: bool = False,
+):
+    account_id = _resolve_account_id(account_id)
+    _running[account_id] = False
+    task = _tasks.get(account_id)
+    if task and not task.done():
+        task.cancel()
         try:
-            await _task
+            await task
         except asyncio.CancelledError:
             pass
-    _task = None
+    _tasks.pop(account_id, None)
+    with account_context(account_id):
+        db = get_db()
+        await db.state.update_one(
+            {"key": "promotion_running"},
+            {"$set": {"value": False}},
+            upsert=True,
+        )
+        if not preserve_state:
+            await db.state.delete_many({
+                "key": {
+                    "$in": [
+                        "promotion_group_cursor",
+                        "promotion_cycle_stats",
+                        "promotion_continuous_runtime_seconds",
+                        "promotion_continuous_runtime_active_since",
+                        "promotion_rest_until",
+                    ]
+                }
+            })
 
 
-def is_running() -> bool:
-    global _running, _task
-    return bool(_running and _task is not None and not _task.done())
+def is_running(account_id: int | None = None) -> bool:
+    account_id = _resolve_account_id(account_id)
+    task = _tasks.get(account_id)
+    return bool(_running.get(account_id, False) and task is not None and not task.done())
 
 
-async def restore_state(bot):
+async def restore_state(bot, account_id: int | None = None):
     """Resume the promotion loop automatically if it was running before restart."""
+    account_id = _resolve_account_id(account_id)
+    with account_context(account_id):
+        await _restore_account_state(bot, account_id)
+
+
+async def _restore_account_state(bot, account_id: int):
     db = get_db()
     doc = await db.state.find_one({"key": "promotion_running"})
     if doc and doc.get("value"):
         if await _has_active_cooldown(db) or await _is_safety_pause_active(db):
             print("⏳ Active safety pause detected after restart — promotion remains paused")
-            await start_promotion(bot)
+            await start_promotion(bot, account_id)
             return
         print("🔄 Resuming promotion from previous session...")
-        await start_promotion(bot)
+        await start_promotion(bot, account_id)
+
+
+async def shutdown() -> None:
+    tasks = list(_tasks.items())
+    for account_id, task in tasks:
+        _running[account_id] = False
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(
+            *(task for _, task in tasks),
+            return_exceptions=True,
+        )
+    _tasks.clear()

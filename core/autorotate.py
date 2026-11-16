@@ -21,6 +21,7 @@ from config import OWNER_ID
 from core.promotion import _log_event
 from core.userbot import userbot
 from database import get_db
+from core.account_context import account_context, current_account_id
 
 log = logging.getLogger(__name__)
 
@@ -48,8 +49,8 @@ INTERVAL_PRESET_LABELS = {
 
 _jobs: dict[str, asyncio.Task] = {}
 _recovery_jobs: dict[str, asyncio.Task] = {}
-_group_send_lock = asyncio.Lock()
-_media_cache: dict[str, bytes] = {}
+_group_send_locks: dict[int, asyncio.Lock] = {}
+_media_cache: dict[tuple[int, str], bytes] = {}
 _PERMANENT_GROUP_ERRORS = (
     ChannelInvalid,
     ChannelPrivate,
@@ -95,6 +96,21 @@ def _to_datetime(value) -> datetime | None:
 
 def _config_key(config_id) -> str:
     return str(config_id)
+
+
+def _current_account_id() -> int:
+    account_id = current_account_id()
+    if account_id is None:
+        from core.accounts import account_manager
+
+        account_id = account_manager.selected_account_id
+    if account_id is None:
+        raise RuntimeError("No Telegram account is selected.")
+    return int(account_id)
+
+
+def _group_send_lock() -> asyncio.Lock:
+    return _group_send_locks.setdefault(_current_account_id(), asyncio.Lock())
 
 
 def _collection():
@@ -233,13 +249,14 @@ async def _send_private_test(bot, message: dict) -> None:
 
 
 async def _download_media(bot, file_id: str) -> io.BytesIO:
-    data = _media_cache.get(file_id)
+    cache_key = (_current_account_id(), file_id)
+    data = _media_cache.get(cache_key)
     if data is None:
         telegram_file = await bot.get_file(file_id)
         buffer = io.BytesIO()
         await telegram_file.download_to_memory(buffer)
         data = buffer.getvalue()
-        _media_cache[file_id] = data
+        _media_cache[cache_key] = data
         if len(_media_cache) > 5:
             _media_cache.pop(next(iter(_media_cache)))
     result = io.BytesIO(data)
@@ -274,7 +291,7 @@ async def _persist_floodwait_cooldown(wait_seconds: int, now: datetime | None = 
 
 async def _send_group(bot, chat_id: int, message: dict) -> None:
     db = get_db()
-    async with _group_send_lock:
+    async with _group_send_lock():
         await _wait_for_group_cooldown(db)
         try:
             message_type = message.get("type")
@@ -1078,6 +1095,42 @@ async def shutdown() -> None:
             task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+    _group_send_locks.clear()
+    _media_cache.clear()
+
+
+async def shutdown_account(account_id: int) -> None:
+    with account_context(account_id):
+        configs = await _collection().find({}, {"_id": 1}).to_list(None)
+    keys = {str(config["_id"]) for config in configs}
+    tasks = []
+    for key in keys:
+        task = _jobs.pop(key, None)
+        recovery_task = _recovery_jobs.pop(key, None)
+        if task:
+            tasks.append(task)
+        if recovery_task:
+            tasks.append(recovery_task)
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    with account_context(account_id):
+        await get_db().autorotate_configs.update_many(
+            {"$or": [{"status": "running"}, {"auto_resume": True}]},
+            {
+                "$set": {
+                    "status": "paused",
+                    "last_error": "Account was disconnected or removed; review before resuming.",
+                    "updated_at": _now(),
+                },
+                "$unset": {"auto_resume": ""},
+            },
+        )
+    _group_send_locks.pop(int(account_id), None)
+    for cache_key in [key for key in _media_cache if key[0] == int(account_id)]:
+        _media_cache.pop(cache_key, None)
 
 
 def active_job_count() -> int:

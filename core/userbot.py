@@ -10,7 +10,7 @@ from pyrogram.errors import (
     ChannelInvalid,
 )
 
-from config import API_ID, API_HASH, SESSION_STRING
+from config import API_ID, API_HASH
 
 log = logging.getLogger(__name__)
 
@@ -39,9 +39,26 @@ class _SafeClient(Client):
         # All other exceptions propagate normally so real errors are not hidden.
 
 
-userbot = _SafeClient(
-    name="userbot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING,
-)
+def create_user_client(session_string: str, name: str) -> Client:
+    return _SafeClient(
+        name=name,
+        api_id=API_ID,
+        api_hash=API_HASH,
+        session_string=session_string,
+    )
+
+
+class _UserbotRouter:
+    """Compatibility router that resolves the current account's client per call."""
+
+    def __getattr__(self, name):
+        from core.accounts import account_manager
+
+        from core.account_context import current_account_id
+
+        return getattr(
+            account_manager.get_client(current_account_id()), name
+        )
+
+
+userbot = _UserbotRouter()

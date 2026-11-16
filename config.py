@@ -1,7 +1,5 @@
 import os
 import sys
-import base64
-import struct
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -10,7 +8,6 @@ REQUIRED_VARS = [
     "BOT_TOKEN",
     "API_ID",
     "API_HASH",
-    "SESSION_STRING",
     "OWNER_ID",
     "MONGO_URI",
 ]
@@ -23,9 +20,12 @@ if missing:
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")
+# Keep supporting deployments that still provide the old single-account
+# session. It is imported into the encrypted accounts collection at startup.
+SESSION_STRING = os.getenv("SESSION_STRING") or os.getenv("USERBOT_SESSION_STRING")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 MONGO_URI = os.getenv("MONGO_URI")
+SESSION_ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY")
 
 # Seconds between promotion cycles. Override via PROMOTION_INTERVAL_SECONDS
 # environment variable; defaults to 600 (10 minutes).
@@ -58,30 +58,3 @@ PROMOTION_LONG_FLOODWAIT_THRESHOLD_SECONDS = int(
 EXTRA_LONG_FLOODWAIT_BUFFER_SECONDS = int(
     os.getenv("EXTRA_LONG_FLOODWAIT_BUFFER_SECONDS", 300)
 )
-
-# ── Validate SESSION_STRING format ────────────────────────────────────────────
-# Pyrogram 2.0.106 accepts 271 bytes (new), 267 bytes (old 64-bit),
-# or 263 bytes (old 32-bit) after base64url-decoding.
-_VALID_SIZES = {271, 267, 263}
-try:
-    _decoded = base64.urlsafe_b64decode(
-        SESSION_STRING + "=" * (-len(SESSION_STRING) % 4)
-    )
-    if len(_decoded) not in _VALID_SIZES:
-        print(
-            f"❌ SESSION_STRING is incompatible with Pyrogram 2.0.106.\n"
-            f"   Decoded size: {len(_decoded)} bytes "
-            f"(accepted: {sorted(_VALID_SIZES)}).\n"
-            f"   Please regenerate it with Pyrogram 2.0.106:\n\n"
-            f"     from pyrogram import Client\n"
-            f"     import asyncio\n\n"
-            f"     async def gen():\n"
-            f"         async with Client('tmp', api_id={os.getenv('API_ID')},\n"
-            f"                           api_hash='YOUR_API_HASH') as app:\n"
-            f"             print(await app.export_session_string())\n\n"
-            f"     asyncio.run(gen())\n"
-        )
-        sys.exit(1)
-except Exception as e:
-    print(f"❌ SESSION_STRING could not be decoded: {e}")
-    sys.exit(1)

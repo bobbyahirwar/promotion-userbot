@@ -14,6 +14,8 @@ from telegram.ext import (
 
 from config import OWNER_ID
 from core import autorotate
+from core.account_context import account_context, current_account_id
+from core.accounts import account_manager
 from database import get_db
 from handlers.admin import owner_only
 from handlers.messages import _preview
@@ -411,6 +413,7 @@ async def _show_configuration(query, config_id: str, notice: str | None = None) 
 
 async def _begin_group_edit(query, user_id: int, config: dict, mode: str) -> None:
     _ui_drafts[user_id] = {
+        "account_id": current_account_id() or account_manager.selected_account_id,
         "mode": mode,
         "config_id": str(config["_id"]),
         "group_ids": list(config.get("group_ids", [])),
@@ -423,6 +426,7 @@ async def _begin_group_edit(query, user_id: int, config: dict, mode: str) -> Non
 
 async def _begin_message_edit(query, user_id: int, config: dict) -> None:
     _ui_drafts[user_id] = {
+        "account_id": current_account_id() or account_manager.selected_account_id,
         "mode": "edit_messages",
         "config_id": str(config["_id"]),
         "group_ids": list(config.get("group_ids", [])),
@@ -435,6 +439,7 @@ async def _begin_message_edit(query, user_id: int, config: dict) -> None:
 
 async def _begin_interval_edit(query, user_id: int, config: dict) -> None:
     _ui_drafts[user_id] = {
+        "account_id": current_account_id() or account_manager.selected_account_id,
         "mode": "edit_interval",
         "config_id": str(config["_id"]),
         "group_ids": list(config.get("group_ids", [])),
@@ -525,6 +530,7 @@ async def _show_custom_interval_prompt(query, user_id: int, context: ContextType
     _custom_interval_inputs[user_id] = {
         "chat_id": query.message.chat_id,
         "message_id": query.message.message_id,
+        "account_id": draft.get("account_id"),
     }
     await _edit_query(
         query,
@@ -542,6 +548,28 @@ async def _handle_custom_interval(update: Update, context: ContextTypes.DEFAULT_
     message = update.effective_message
     if not pending or not message or message.chat_id != pending["chat_id"]:
         return
+    account_id = pending.get("account_id")
+    if account_id is not None and account_id != account_manager.selected_account_id:
+        _custom_interval_inputs.pop(user_id, None)
+        _ui_drafts.pop(user_id, None)
+        await message.reply_text(
+            "The selected account changed. Reopen AutoRotate for the current account."
+        )
+        return
+    if account_id is not None:
+        with account_context(account_id):
+            await _apply_custom_interval(update, context, user_id, pending)
+        return
+    await _apply_custom_interval(update, context, user_id, pending)
+
+
+async def _apply_custom_interval(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    pending: dict,
+) -> None:
+    message = update.effective_message
     text = (message.text or "").strip()
     editor = _MessageEditor(context.bot, pending["chat_id"], pending["message_id"])
     try:
@@ -657,6 +685,7 @@ async def _dispatch_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _show_help(query)
     elif action == "create":
         _ui_drafts[user_id] = {
+            "account_id": current_account_id() or account_manager.selected_account_id,
             "mode": "new",
             "name": f"Rotation {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}",
             "group_ids": [],
@@ -862,11 +891,39 @@ async def _dispatch_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def callback_autorotate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user and update.effective_user.id == OWNER_ID:
+        account_id = account_manager.selected_account_id
+        if account_id is not None:
+            with account_context(account_id):
+                await _callback_autorotate_scoped(update, context)
+            return
+    await _callback_autorotate_scoped(update, context)
+
+
+async def _callback_autorotate_scoped(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     query = update.callback_query
     if not query:
         return
     if _owner_id(update) != OWNER_ID:
         await _safe_answer(query, "Only the bot owner can use AutoRotate controls.", show_alert=True)
+        return
+    draft = _ui_drafts.get(OWNER_ID)
+    selected_account_id = current_account_id() or account_manager.selected_account_id
+    if (
+        draft
+        and draft.get("account_id") is not None
+        and draft["account_id"] != selected_account_id
+    ):
+        _ui_drafts.pop(OWNER_ID, None)
+        _custom_interval_inputs.pop(OWNER_ID, None)
+        await _safe_answer(
+            query,
+            "The selected account changed. Reopen AutoRotate for the current account.",
+            show_alert=True,
+        )
+        await _show_home(query, "Account selection changed. Reopen AutoRotate to continue.")
         return
     callback_id = query.id
     if callback_id in _callback_ids:
