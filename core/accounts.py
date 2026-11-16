@@ -2,7 +2,6 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from cryptography.fernet import Fernet, InvalidToken
 from pyrogram import Client
 from pyrogram.errors import (
     AuthKeyDuplicated,
@@ -11,7 +10,7 @@ from pyrogram.errors import (
     SessionRevoked,
 )
 
-from config import API_ID, API_HASH, OWNER_ID, SESSION_ENCRYPTION_KEY, SESSION_STRING
+from config import API_ID, API_HASH, OWNER_ID, SESSION_STRING
 from core.account_context import account_context, current_account_id
 from core.userbot import create_user_client
 from database import get_raw_db
@@ -33,29 +32,7 @@ class AccountManager:
         self.status: dict[int, str] = {}
         self._removing: set[int] = set()
         self.selected_account_id: int | None = None
-        self._cipher: Fernet | None = None
         self._monitor_task: asyncio.Task | None = None
-
-    def _get_cipher(self) -> Fernet:
-        if self._cipher is None:
-            if not SESSION_ENCRYPTION_KEY:
-                raise RuntimeError(
-                    "SESSION_ENCRYPTION_KEY must be configured before accounts can start."
-                )
-            try:
-                self._cipher = Fernet(SESSION_ENCRYPTION_KEY.encode("ascii"))
-            except (ValueError, UnicodeEncodeError) as exc:
-                raise RuntimeError("SESSION_ENCRYPTION_KEY is not a valid Fernet key.") from exc
-        return self._cipher
-
-    def _encrypt(self, session_string: str) -> str:
-        return self._get_cipher().encrypt(session_string.encode("utf-8")).decode("ascii")
-
-    def _decrypt(self, encrypted_session: str) -> str:
-        try:
-            return self._get_cipher().decrypt(encrypted_session.encode("ascii")).decode("utf-8")
-        except (InvalidToken, ValueError, UnicodeEncodeError, UnicodeDecodeError) as exc:
-            raise AccountError("Stored account credentials could not be decrypted.") from exc
 
     def get_client(self, account_id: int | None = None) -> Client:
         account_id = account_id or current_account_id() or self.selected_account_id
@@ -68,13 +45,12 @@ class AccountManager:
 
     async def list_accounts(self) -> list[dict]:
         return await get_raw_db().accounts.find(
-            {"owner_id": OWNER_ID, "active": True}, {"encrypted_session": 0}
+            {"owner_id": OWNER_ID, "active": True}, {"session_string": 0}
         ).sort(
             [("created_at", 1), ("account_id", 1)]
         ).to_list(None)
 
     async def startup(self) -> None:
-        self._get_cipher()
         db = get_raw_db()
         records = await db.accounts.find(
             {"owner_id": OWNER_ID, "active": True}
@@ -96,7 +72,7 @@ class AccountManager:
                 continue
             client = None
             try:
-                session_string = self._decrypt(record["encrypted_session"])
+                session_string = record["session_string"]
                 client = create_user_client(session_string, f"account-{account_id}")
                 await client.start()
                 me = await client.get_me()
@@ -130,7 +106,6 @@ class AccountManager:
     async def add_session(self, session_string: str, select: bool = True) -> dict:
         if not isinstance(session_string, str) or not session_string.strip():
             raise AccountError("Send a Pyrogram StringSession.")
-        self._get_cipher()
         client = create_user_client(session_string.strip(), "account-validation")
         registered = False
         account_id = None
@@ -157,7 +132,7 @@ class AccountManager:
                     value for value in (me.first_name, me.last_name) if value
                 ) or str(account_id),
                 "username": me.username or "",
-                "encrypted_session": self._encrypt(session_string.strip()),
+                "session_string": session_string.strip(),
                 "active": True,
                 "selected": False,
                 "created_at": (existing or {}).get("created_at", now),
@@ -166,7 +141,10 @@ class AccountManager:
             if existing:
                 await db.accounts.update_one(
                     {"_id": existing["_id"]},
-                    {"$set": record},
+                    {
+                        "$set": record,
+                        "$unset": {"encrypted_session": ""},
+                    },
                 )
             else:
                 await db.accounts.insert_one(record)
@@ -242,7 +220,7 @@ class AccountManager:
                     "selected": False,
                     "removed_at": datetime.now(timezone.utc),
                 },
-                "$unset": {"encrypted_session": ""},
+                "$unset": {"session_string": "", "encrypted_session": ""},
             },
         )
         if not result.modified_count:
@@ -320,7 +298,7 @@ class AccountManager:
         client = None
         try:
             client = create_user_client(
-                self._decrypt(record["encrypted_session"]), f"account-{account_id}"
+                record["session_string"], f"account-{account_id}"
             )
             await client.start()
             me = await client.get_me()

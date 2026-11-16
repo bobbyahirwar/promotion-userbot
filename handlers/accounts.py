@@ -142,14 +142,14 @@ async def _show_help(query) -> None:
         "asyncio.run(main())\n\n"
         "Keep the printed StringSession private and remove it from your terminal history.\n"
         "2. Choose Add Account and send the generated StringSession. The bot "
-        "validates it, encrypts it, and deletes the incoming message when Telegram allows.\n"
+        "validates it, saves it, and deletes the incoming message when Telegram allows.\n"
         "3. Use Manage Accounts → Select Account to choose which account the control "
         "panel commands will manage.\n"
         "4. Use Manage Accounts → Remove Account and confirm to disconnect that account. "
         "Its account-specific data and historical logs are retained.\n\n"
         "Groups, saved messages, settings, AutoRotate configurations, scheduler state, "
         "and logs are isolated by Telegram user ID. Identical chat IDs on different "
-        "accounts do not share data. StringSessions are encrypted at rest; never share "
+        "accounts do not share data. StringSessions are stored in MongoDB; never share "
         "them with anyone."
     )
     await query.edit_message_text(
@@ -170,7 +170,7 @@ async def _begin_add(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["awaiting_account_session"] = True
     await query.edit_message_text(
         "Send a Pyrogram 2.0.106 StringSession in your next message.\n"
-        "It will be validated and encrypted before storage. Do not send it to anyone else.",
+        "It will be validated before storage. Do not send it to anyone else.",
         reply_markup=InlineKeyboardMarkup([[_button("Cancel", "cancel-add")]]),
     )
 

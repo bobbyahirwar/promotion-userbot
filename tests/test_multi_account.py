@@ -4,8 +4,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from cryptography.fernet import Fernet
-
 os.environ.update({
     "BOT_TOKEN": "123:validation-token",
     "API_ID": "1",
@@ -56,10 +54,17 @@ class _AccountCollection:
 
     def find(self, query=None, projection=None):
         query = query or {}
-        return _Cursor([
-            doc.copy() for doc in self.documents
-            if all(doc.get(key) == value for key, value in query.items())
-        ])
+        documents = []
+        for doc in self.documents:
+            if not all(doc.get(key) == value for key, value in query.items()):
+                continue
+            result = doc.copy()
+            if projection:
+                for key, exclude in projection.items():
+                    if not exclude:
+                        result.pop(key, None)
+            documents.append(result)
+        return _Cursor(documents)
 
     async def insert_one(self, document):
         stored = document.copy()
@@ -140,13 +145,10 @@ class _FakeDatabase:
 
 class MultiAccountTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.key = Fernet.generate_key().decode("ascii")
         self.manager = AccountManager()
         self.raw_db = SimpleNamespace(accounts=_AccountCollection())
         self.manager_patch = patch("core.accounts.get_raw_db", return_value=self.raw_db)
         self.manager_patch.start()
-        self.key_patch = patch("core.accounts.SESSION_ENCRYPTION_KEY", self.key)
-        self.key_patch.start()
         self.clients = {}
 
         def make_client(session_string, name):
@@ -161,10 +163,9 @@ class MultiAccountTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.manager.shutdown()
         self.manager_patch.stop()
-        self.key_patch.stop()
         self.client_patch.stop()
 
-    async def test_accounts_encrypt_sessions_select_independently_and_remove_one(self):
+    async def test_accounts_store_sessions_select_independently_and_remove_one(self):
         first = await self.manager.add_session("pyrogram-session-101")
         second = await self.manager.add_session("pyrogram-session-202")
 
@@ -173,8 +174,10 @@ class MultiAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.clients[202].is_connected)
         saved = self.raw_db.accounts.documents
         self.assertEqual({doc["account_id"] for doc in saved}, {101, 202})
-        self.assertNotIn("pyrogram-session-101", saved[0]["encrypted_session"])
-        self.assertEqual(self.manager._decrypt(saved[0]["encrypted_session"]), "pyrogram-session-101")
+        self.assertEqual(saved[0]["session_string"], "pyrogram-session-101")
+        self.assertNotIn("encrypted_session", saved[0])
+        listed = await self.manager.list_accounts()
+        self.assertTrue(all("session_string" not in account for account in listed))
 
         self.assertTrue(await self.manager.select_account(first["account_id"]))
         self.assertEqual(self.manager.selected_account_id, 101)
@@ -190,6 +193,7 @@ class MultiAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.selected_account_id, 202)
         self.assertFalse(saved[0]["active"])
         self.assertTrue(saved[1]["active"])
+        self.assertNotIn("session_string", saved[0])
         self.assertNotIn("encrypted_session", saved[0])
 
     async def test_duplicate_identity_is_rejected_even_with_a_different_session_string(self):
@@ -200,15 +204,14 @@ class MultiAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.raw_db.accounts.documents), 1)
         self.assertTrue(self.manager.clients[101].is_connected)
 
-    async def test_startup_reloads_each_encrypted_account_without_sharing_clients(self):
+    async def test_startup_reloads_plain_sessions_without_sharing_clients(self):
         for account_id in (101, 202):
-            encrypted = self.manager._encrypt(f"pyrogram-session-{account_id}")
             self.raw_db.accounts.documents.append({
                 "_id": account_id,
                 "owner_id": 1,
                 "account_id": account_id,
                 "telegram_user_id": account_id,
-                "encrypted_session": encrypted,
+                "session_string": f"pyrogram-session-{account_id}",
                 "active": True,
                 "selected": account_id == 202,
                 "created_at": account_id,
@@ -219,6 +222,24 @@ class MultiAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(self.manager.clients), {101, 202})
         self.assertEqual(self.manager.selected_account_id, 202)
         self.assertTrue(all(client.is_connected for client in self.manager.clients.values()))
+
+    async def test_restart_and_reconnect_use_stored_plain_session_without_a_key(self):
+        await self.manager.add_session("pyrogram-session-101")
+        self.assertEqual(
+            self.raw_db.accounts.documents[0]["session_string"],
+            "pyrogram-session-101",
+        )
+        await self.manager.shutdown()
+
+        restarted_manager = AccountManager()
+        with patch.dict(os.environ):
+            os.environ.pop("SESSION_ENCRYPTION_KEY", None)
+            await restarted_manager.startup()
+            self.assertTrue(restarted_manager.clients[101].is_connected)
+            self.clients[101].is_connected = False
+            self.assertTrue(await restarted_manager.reconnect_account(101))
+            self.assertTrue(restarted_manager.clients[101].is_connected)
+            await restarted_manager.shutdown()
 
     async def test_invalid_session_is_reported_without_echoing_credentials(self):
         self.client_patch.stop()

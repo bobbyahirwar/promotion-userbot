@@ -5,4 +5,3 @@ python-dotenv==1.0.1
 python-telegram-bot
 flask
 psutil
-cryptography==44.0.2

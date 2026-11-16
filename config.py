@@ -21,11 +21,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 # Keep supporting deployments that still provide the old single-account
-# session. It is imported into the encrypted accounts collection at startup.
+# session. It is imported into the accounts collection at startup.
 SESSION_STRING = os.getenv("SESSION_STRING") or os.getenv("USERBOT_SESSION_STRING")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 MONGO_URI = os.getenv("MONGO_URI")
-SESSION_ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY")
 
 # Seconds between promotion cycles. Override via PROMOTION_INTERVAL_SECONDS
 # environment variable; defaults to 600 (10 minutes).
