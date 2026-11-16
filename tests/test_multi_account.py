@@ -43,6 +43,8 @@ class _Cursor:
 class _AccountCollection:
     def __init__(self, documents=None):
         self.documents = list(documents or [])
+        self.insert_error = None
+        self.update_many_error = None
 
     async def find_one(self, query):
         return next(
@@ -67,6 +69,8 @@ class _AccountCollection:
         return _Cursor(documents)
 
     async def insert_one(self, document):
+        if self.insert_error:
+            raise self.insert_error
         stored = document.copy()
         stored["_id"] = len(self.documents) + 1
         self.documents.append(stored)
@@ -83,6 +87,8 @@ class _AccountCollection:
         return SimpleNamespace(matched_count=0, modified_count=0)
 
     async def update_many(self, query, update):
+        if self.update_many_error:
+            raise self.update_many_error
         count = 0
         for document in self.documents:
             if all(document.get(key) == value for key, value in query.items()):
@@ -196,6 +202,23 @@ class MultiAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("session_string", saved[0])
         self.assertNotIn("encrypted_session", saved[0])
 
+    async def test_clients_use_shared_api_credentials_with_independent_sessions(self):
+        from core import userbot
+        from config import API_HASH, API_ID
+
+        with patch.object(userbot, "_SafeClient") as client_factory:
+            userbot.create_user_client("unique-session-101", "account-101")
+            userbot.create_user_client("unique-session-202", "account-202")
+
+        self.assertEqual(client_factory.call_count, 2)
+        first, second = (call.kwargs for call in client_factory.call_args_list)
+        self.assertEqual(first["api_id"], API_ID)
+        self.assertEqual(second["api_id"], API_ID)
+        self.assertEqual(first["api_hash"], API_HASH)
+        self.assertEqual(second["api_hash"], API_HASH)
+        self.assertEqual(first["session_string"], "unique-session-101")
+        self.assertEqual(second["session_string"], "unique-session-202")
+
     async def test_duplicate_identity_is_rejected_even_with_a_different_session_string(self):
         await self.manager.add_session("pyrogram-session-101")
         with self.assertRaises(AccountError) as raised:
@@ -203,6 +226,34 @@ class MultiAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("already connected", str(raised.exception))
         self.assertEqual(len(self.raw_db.accounts.documents), 1)
         self.assertTrue(self.manager.clients[101].is_connected)
+
+    async def test_mongodb_save_failure_is_stage_specific_and_preserves_other_clients(self):
+        await self.manager.add_session("pyrogram-session-202")
+        self.raw_db.accounts.insert_error = RuntimeError("database unavailable")
+
+        with self.assertLogs("core.accounts", level="ERROR") as captured:
+            with self.assertRaises(AccountError) as raised:
+                await self.manager.add_session("pyrogram-session-303")
+
+        self.assertIn("MongoDB account save", str(raised.exception))
+        self.assertIn("MongoDB account save", captured.output[0])
+        self.assertIn("RuntimeError", captured.output[0])
+        self.assertNotIn("database unavailable", captured.output[0])
+        self.assertNotIn("pyrogram-session-303", captured.output[0])
+        self.assertNotIn("validation-hash", captured.output[0])
+        self.assertTrue(self.manager.clients[202].is_connected)
+        self.assertNotIn(303, self.manager.clients)
+        self.assertTrue(self.clients[303].stopped)
+
+    async def test_selection_failure_keeps_saved_account_connected_and_reports_warning(self):
+        self.raw_db.accounts.update_many_error = RuntimeError("database unavailable")
+
+        with self.assertLogs("core.accounts", level="ERROR"):
+            account = await self.manager.add_session("pyrogram-session-202")
+
+        self.assertTrue(account["selection_warning"])
+        self.assertEqual(len(self.raw_db.accounts.documents), 1)
+        self.assertTrue(self.manager.clients[202].is_connected)
 
     async def test_startup_reloads_plain_sessions_without_sharing_clients(self):
         for account_id in (101, 202):
@@ -222,6 +273,24 @@ class MultiAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(self.manager.clients), {101, 202})
         self.assertEqual(self.manager.selected_account_id, 202)
         self.assertTrue(all(client.is_connected for client in self.manager.clients.values()))
+
+    async def test_startup_retains_legacy_encrypted_only_records_without_connecting(self):
+        legacy_record = {
+            "_id": 101,
+            "owner_id": 1,
+            "account_id": 101,
+            "encrypted_session": "legacy-encrypted-value",
+            "active": True,
+            "selected": True,
+        }
+        self.raw_db.accounts.documents.append(legacy_record.copy())
+
+        with self.assertLogs("core.accounts", level="ERROR") as captured:
+            await self.manager.startup()
+
+        self.assertIn("MissingSessionString", captured.output[0])
+        self.assertEqual(self.raw_db.accounts.documents, [legacy_record])
+        self.assertNotIn(101, self.manager.clients)
 
     async def test_restart_and_reconnect_use_stored_plain_session_without_a_key(self):
         await self.manager.add_session("pyrogram-session-101")
@@ -248,9 +317,11 @@ class MultiAccountTests(unittest.IsolatedAsyncioTestCase):
             return_value=_FakeClient(0, SessionRevoked("sensitive-session-value")),
         )
         self.client_patch.start()
-        with self.assertRaises(AccountError) as raised:
-            await self.manager.add_session("sensitive-session-value")
+        with self.assertLogs("core.accounts", level="ERROR") as captured:
+            with self.assertRaises(AccountError) as raised:
+                await self.manager.add_session("sensitive-session-value")
         self.assertNotIn("sensitive-session-value", str(raised.exception))
+        self.assertNotIn("sensitive-session-value", "\n".join(captured.output))
         self.assertIn("invalid, expired, unauthorized", str(raised.exception))
 
     async def test_reconnecting_one_account_does_not_replace_another_client(self):

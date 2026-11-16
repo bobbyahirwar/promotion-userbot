@@ -305,9 +305,18 @@ async def _receive_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         sync_note = "\nGroup synchronization will need to be retried."
 
     username = f" (@{account['username']})" if account.get("username") else ""
+    selection_note = (
+        "\nIt is connected, but could not be selected automatically. "
+        "Select it from Manage Accounts."
+        if account.get("selection_warning")
+        else ""
+    )
     await context.bot.send_message(
         chat_id=message.chat_id,
-        text=f"✅ Connected {account['name']}{username}\nAccount ID: {account_id}{sync_note}",
+        text=(
+            f"✅ Connected {account['name']}{username}\n"
+            f"Account ID: {account_id}{selection_note}{sync_note}"
+        ),
     )
     menu_text, keyboard = await _main_menu_content()
     await context.bot.send_message(

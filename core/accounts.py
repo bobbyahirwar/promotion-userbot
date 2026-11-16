@@ -17,6 +17,29 @@ from database import get_raw_db
 
 log = logging.getLogger(__name__)
 
+_ADD_FAILURE_MESSAGES = {
+    "Pyrogram client initialization": (
+        "Could not initialize a Pyrogram client for this session. "
+        "Confirm it is a Pyrogram 2.0.106 StringSession."
+    ),
+    "session parsing or Telegram authorization": (
+        "Session parsing or Telegram authorization failed. Confirm the session is "
+        "valid, authorized, and generated with the configured API credentials."
+    ),
+    "Telegram account lookup": (
+        "Telegram authorized the session, but retrieving its account details failed."
+    ),
+    "MongoDB account lookup": (
+        "Could not check for an existing account in MongoDB."
+    ),
+    "MongoDB account save": (
+        "Could not save the account in MongoDB. The account was not reported as added."
+    ),
+    "account manager registration": (
+        "The account was saved, but could not be registered as a connected account."
+    ),
+}
+
 
 class AccountError(Exception):
     """A safe, user-facing account operation error."""
@@ -71,10 +94,21 @@ class AccountManager:
                 self.status[account_id] = "Connected"
                 continue
             client = None
+            stage = "Pyrogram client initialization"
             try:
-                session_string = record["session_string"]
+                session_string = record.get("session_string")
+                if not isinstance(session_string, str) or not session_string.strip():
+                    self.status[account_id] = "Session unavailable"
+                    log.error(
+                        "Account %s failed startup at stored session loading "
+                        "(MissingSessionString). The record was retained.",
+                        account_id,
+                    )
+                    continue
                 client = create_user_client(session_string, f"account-{account_id}")
+                stage = "session parsing or Telegram authorization"
                 await client.start()
+                stage = "Telegram account lookup"
                 me = await client.get_me()
                 if me.id != account_id:
                     await client.stop()
@@ -83,9 +117,14 @@ class AccountManager:
                     continue
                 self.clients[account_id] = client
                 self.status[account_id] = "Connected"
-            except Exception:
+            except Exception as exc:
                 self.status[account_id] = "Disconnected"
-                log.error("Account %s failed to connect at startup.", account_id)
+                log.error(
+                    "Account %s failed startup during %s (exception_type=%s).",
+                    account_id,
+                    stage,
+                    type(exc).__name__,
+                )
                 if client and client.is_connected:
                     try:
                         await client.stop()
@@ -106,15 +145,20 @@ class AccountManager:
     async def add_session(self, session_string: str, select: bool = True) -> dict:
         if not isinstance(session_string, str) or not session_string.strip():
             raise AccountError("Send a Pyrogram StringSession.")
-        client = create_user_client(session_string.strip(), "account-validation")
+        client = None
         registered = False
         account_id = None
+        stage = "Pyrogram client initialization"
         try:
+            client = create_user_client(session_string.strip(), "account-validation")
+            stage = "session parsing or Telegram authorization"
             await client.start()
+            stage = "Telegram account lookup"
             me = await client.get_me()
             if getattr(me, "is_bot", False):
                 raise AccountError("Only a Telegram user account StringSession can be added.")
             account_id = int(me.id)
+            stage = "MongoDB account lookup"
             db = get_raw_db()
             existing = await db.accounts.find_one({
                 "owner_id": OWNER_ID,
@@ -138,48 +182,96 @@ class AccountManager:
                 "created_at": (existing or {}).get("created_at", now),
                 "updated_at": now,
             }
+            stage = "MongoDB account save"
             if existing:
-                await db.accounts.update_one(
+                result = await db.accounts.update_one(
                     {"_id": existing["_id"]},
                     {
                         "$set": record,
                         "$unset": {"encrypted_session": ""},
                     },
                 )
+                if not result.matched_count:
+                    raise RuntimeError("Account record was not matched for update.")
             else:
-                await db.accounts.insert_one(record)
+                result = await db.accounts.insert_one(record)
+                if not result.inserted_id:
+                    raise RuntimeError("MongoDB did not confirm the account insert.")
+
+            stage = "account manager registration"
             self.clients[account_id] = client
             self.status[account_id] = "Connected"
-            if select or self.selected_account_id is None:
-                if not await self.select_account(account_id):
-                    raise RuntimeError("Account selection could not be saved.")
             registered = True
+            selection_warning = False
+            if select or self.selected_account_id is None:
+                stage = "account selection"
+                try:
+                    selection_warning = not await self.select_account(account_id)
+                except Exception as exc:
+                    selection_warning = True
+                    safe_code = getattr(exc, "code", None)
+                    diagnostic = f"exception_type={type(exc).__name__}"
+                    if isinstance(safe_code, int):
+                        diagnostic += f", code={safe_code}"
+                    log.error(
+                        "Account %s was saved and connected, but selection failed "
+                        "(%s).",
+                        account_id,
+                        diagnostic,
+                    )
+                if selection_warning:
+                    log.error(
+                        "Account %s was saved and connected, but selection was not "
+                        "confirmed.",
+                        account_id,
+                    )
             return {
                 "account_id": account_id,
                 "name": record["name"],
                 "username": record["username"],
+                "selection_warning": selection_warning,
             }
         except DuplicateAccountError:
             raise
-        except AccountError:
+        except AccountError as exc:
+            log.error(
+                "Account addition rejected during %s (exception_type=%s).",
+                stage,
+                type(exc).__name__,
+            )
             raise
-        except (AuthKeyUnregistered, SessionExpired, SessionRevoked, AuthKeyDuplicated) as exc:
-            raise AccountError(
-                "This session is invalid, expired, unauthorized, or incompatible. "
-                "Generate a new Pyrogram 2.0.106 StringSession."
-            ) from exc
         except Exception as exc:
-            # Do not include the Pyrogram exception text: it can contain sensitive data.
+            safe_code = getattr(exc, "code", None)
+            diagnostic = f"exception_type={type(exc).__name__}"
+            if isinstance(safe_code, int):
+                diagnostic += f", code={safe_code}"
+            log.error(
+                "Account addition failed during %s (%s%s).",
+                stage,
+                diagnostic,
+                f", account_id={account_id}" if account_id is not None else "",
+            )
+            if stage == "session parsing or Telegram authorization" and isinstance(
+                exc,
+                (AuthKeyUnregistered, SessionExpired, SessionRevoked, AuthKeyDuplicated),
+            ):
+                user_message = (
+                    "This Pyrogram session is invalid, expired, unauthorized, or "
+                    "incompatible with the configured API credentials."
+                )
+            else:
+                user_message = _ADD_FAILURE_MESSAGES.get(
+                    stage, f"Account addition failed during {stage}."
+                )
             raise AccountError(
-                "Could not validate or save the session. Check its validity, API credentials, "
-                "and MongoDB connection."
+                f"{user_message} (stage: {stage}; {type(exc).__name__})"
             ) from exc
         finally:
-            if not registered:
-                if account_id is not None and self.clients.get(account_id) is client:
+            if not registered and account_id is not None:
+                if self.clients.get(account_id) is client:
                     self.clients.pop(account_id, None)
                     self.status[account_id] = "Disconnected"
-            if not registered and client.is_connected:
+            if not registered and client and client.is_connected:
                 try:
                     await client.stop()
                 except Exception:
