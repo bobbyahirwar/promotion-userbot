@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from pymongo.errors import DuplicateKeyError
+
 os.environ.update({
     "BOT_TOKEN": "123:validation-token",
     "API_ID": "1",
@@ -44,21 +46,31 @@ class _AccountCollection:
     def __init__(self, documents=None):
         self.documents = list(documents or [])
         self.insert_error = None
+        self.update_one_error = None
         self.update_many_error = None
 
     async def find_one(self, query):
+        def matches(document, condition):
+            if "$or" in condition:
+                return any(matches(document, item) for item in condition["$or"])
+            return all(document.get(key) == value for key, value in condition.items())
+
         return next(
-            (doc.copy() for doc in self.documents if all(
-                doc.get(key) == value for key, value in query.items()
-            )),
+            (doc.copy() for doc in self.documents if matches(doc, query)),
             None,
         )
 
     def find(self, query=None, projection=None):
         query = query or {}
         documents = []
+
+        def matches(document, condition):
+            if "$or" in condition:
+                return any(matches(document, item) for item in condition["$or"])
+            return all(document.get(key) == value for key, value in condition.items())
+
         for doc in self.documents:
-            if not all(doc.get(key) == value for key, value in query.items()):
+            if not matches(doc, query):
                 continue
             result = doc.copy()
             if projection:
@@ -76,15 +88,38 @@ class _AccountCollection:
         self.documents.append(stored)
         return SimpleNamespace(inserted_id=stored["_id"])
 
-    async def update_one(self, query, update):
+    async def update_one(self, query, update, upsert=False):
+        if self.update_one_error:
+            raise self.update_one_error
+
+        def matches(document, condition):
+            if "$or" in condition:
+                return any(matches(document, item) for item in condition["$or"])
+            return all(document.get(key) == value for key, value in condition.items())
+
         for document in self.documents:
-            if not all(document.get(key) == value for key, value in query.items()):
+            if not matches(document, query):
                 continue
             document.update(update.get("$set", {}))
+            if "$setOnInsert" in update and not update.get("$set"):
+                document.update(update["$setOnInsert"])
             for key in update.get("$unset", {}):
                 document.pop(key, None)
             return SimpleNamespace(matched_count=1, modified_count=1)
-        return SimpleNamespace(matched_count=0, modified_count=0)
+        if upsert:
+            stored = {
+                key: value for key, value in query.items()
+                if not key.startswith("$")
+            }
+            stored.update(update.get("$setOnInsert", {}))
+            stored["_id"] = len(self.documents) + 1
+            self.documents.append(stored)
+            return SimpleNamespace(
+                matched_count=0,
+                modified_count=0,
+                upserted_id=stored["_id"],
+            )
+        return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=None)
 
     async def update_many(self, query, update):
         if self.update_many_error:
@@ -219,17 +254,43 @@ class MultiAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["session_string"], "unique-session-101")
         self.assertEqual(second["session_string"], "unique-session-202")
 
-    async def test_duplicate_identity_is_rejected_even_with_a_different_session_string(self):
-        await self.manager.add_session("pyrogram-session-101")
-        with self.assertRaises(AccountError) as raised:
-            await self.manager.add_session("different-session-101")
-        self.assertIn("already connected", str(raised.exception))
+    async def test_duplicate_identity_reuses_connected_client_without_another_record(self):
+        first = await self.manager.add_session("pyrogram-session-101")
+        original_client = self.manager.clients[101]
+
+        duplicate = await self.manager.add_session("different-session-101")
+
+        self.assertTrue(duplicate["already_registered"])
+        self.assertEqual(duplicate["account_id"], first["account_id"])
         self.assertEqual(len(self.raw_db.accounts.documents), 1)
-        self.assertTrue(self.manager.clients[101].is_connected)
+        self.assertIs(self.manager.clients[101], original_client)
+        self.assertTrue(original_client.is_connected)
+        self.assertTrue(self.clients[101].stopped)
+
+    async def test_legacy_record_is_found_by_telegram_id_and_updated_in_place(self):
+        legacy_record = {
+            "_id": 101,
+            "account_id": 101,
+            "session_string": "legacy-session",
+            "active": True,
+            "unrelated_setting": "keep",
+        }
+        self.raw_db.accounts.documents.append(legacy_record.copy())
+
+        result = await self.manager.add_session("pyrogram-session-101")
+
+        self.assertTrue(result["already_registered"])
+        self.assertEqual(len(self.raw_db.accounts.documents), 1)
+        saved = self.raw_db.accounts.documents[0]
+        self.assertEqual(saved["_id"], 101)
+        self.assertEqual(saved["account_id"], 101)
+        self.assertEqual(saved["telegram_user_id"], 101)
+        self.assertEqual(saved["unrelated_setting"], "keep")
+        self.assertEqual(saved["session_string"], "pyrogram-session-101")
 
     async def test_mongodb_save_failure_is_stage_specific_and_preserves_other_clients(self):
         await self.manager.add_session("pyrogram-session-202")
-        self.raw_db.accounts.insert_error = RuntimeError("database unavailable")
+        self.raw_db.accounts.update_one_error = RuntimeError("database unavailable")
 
         with self.assertLogs("core.accounts", level="ERROR") as captured:
             with self.assertRaises(AccountError) as raised:
@@ -245,6 +306,29 @@ class MultiAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(303, self.manager.clients)
         self.assertTrue(self.clients[303].stopped)
 
+    async def test_duplicate_key_diagnostic_reports_index_without_session_data(self):
+        self.raw_db.accounts.update_one_error = DuplicateKeyError(
+            "duplicate key value must not be logged",
+            code=11000,
+            details={
+                "indexName": "telegram_user_id_1",
+                "keyPattern": {"telegram_user_id": 1},
+                "keyValue": {"telegram_user_id": 303},
+            },
+        )
+
+        with self.assertLogs("core.accounts", level="ERROR") as captured:
+            with self.assertRaises(AccountError) as raised:
+                await self.manager.add_session("pyrogram-session-303")
+
+        diagnostic = "\n".join(captured.output)
+        self.assertIn("index=telegram_user_id_1", diagnostic)
+        self.assertIn("keyPattern=[('telegram_user_id', 1)]", diagnostic)
+        self.assertIn("keyValue={'telegram_user_id': 303}", diagnostic)
+        self.assertNotIn("pyrogram-session-303", diagnostic)
+        self.assertNotIn("duplicate key value must not be logged", diagnostic)
+        self.assertIn("DuplicateKeyError", str(raised.exception))
+
     async def test_selection_failure_keeps_saved_account_connected_and_reports_warning(self):
         self.raw_db.accounts.update_many_error = RuntimeError("database unavailable")
 
@@ -255,24 +339,27 @@ class MultiAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.raw_db.accounts.documents), 1)
         self.assertTrue(self.manager.clients[202].is_connected)
 
-    async def test_startup_reloads_plain_sessions_without_sharing_clients(self):
-        for account_id in (101, 202):
-            self.raw_db.accounts.documents.append({
-                "_id": account_id,
-                "owner_id": 1,
-                "account_id": account_id,
-                "telegram_user_id": account_id,
-                "session_string": f"pyrogram-session-{account_id}",
-                "active": True,
-                "selected": account_id == 202,
-                "created_at": account_id,
-            })
-
-        await self.manager.startup()
-
-        self.assertEqual(set(self.manager.clients), {101, 202})
-        self.assertEqual(self.manager.selected_account_id, 202)
-        self.assertTrue(all(client.is_connected for client in self.manager.clients.values()))
+    async def test_startup_reloads_both_registered_accounts_after_restart(self):
+        await self.manager.add_session("pyrogram-session-101")
+        await self.manager.add_session("pyrogram-session-202")
+        self.assertEqual(len(self.raw_db.accounts.documents), 2)
+        await self.manager.shutdown()
+        restarted_manager = AccountManager()
+        with patch("core.accounts.get_raw_db", return_value=self.raw_db):
+            with patch(
+                "core.accounts.create_user_client",
+                side_effect=lambda session, name: _FakeClient(
+                    int(session.split("-")[-1])
+                ),
+            ):
+                await restarted_manager.startup()
+                self.assertEqual(set(restarted_manager.clients), {101, 202})
+                self.assertEqual(restarted_manager.selected_account_id, 202)
+                self.assertTrue(
+                    all(client.is_connected for client in restarted_manager.clients.values())
+                )
+                self.assertEqual(len(self.raw_db.accounts.documents), 2)
+                await restarted_manager.shutdown()
 
     async def test_startup_retains_legacy_encrypted_only_records_without_connecting(self):
         legacy_record = {

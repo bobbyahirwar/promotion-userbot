@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 
+from pymongo.errors import DuplicateKeyError
 from pyrogram import Client
 from pyrogram.errors import (
     AuthKeyDuplicated,
@@ -49,11 +51,92 @@ class DuplicateAccountError(AccountError):
     pass
 
 
+def _account_identity_query(account_id: int) -> dict:
+    identity_values = (account_id, str(account_id))
+    return {
+        "$or": (
+            [{"telegram_user_id": value} for value in identity_values]
+            + [{"account_id": value} for value in identity_values]
+            + [{"_id": value} for value in identity_values]
+        )
+    }
+
+
+def _validate_existing_account(record: dict, account_id: int) -> None:
+    owner_id = record.get("owner_id")
+    if owner_id is not None and str(owner_id) != str(OWNER_ID):
+        raise AccountError("This Telegram account is already registered elsewhere.")
+    for field in ("account_id", "telegram_user_id"):
+        stored_id = record.get(field)
+        if stored_id is None:
+            continue
+        try:
+            matches = int(stored_id) == account_id
+        except (TypeError, ValueError):
+            matches = False
+        if not matches:
+            raise AccountError(
+                f"The existing account record has a conflicting {field}."
+            )
+
+
+async def _find_account_record(db, account_id: int) -> dict | None:
+    records = await db.accounts.find(
+        _account_identity_query(account_id)
+    ).to_list(None)
+    if len(records) > 1:
+        raise AccountError(
+            "Multiple account records already use this Telegram identity. "
+            "No record was changed."
+        )
+    return records[0] if records else None
+
+
+def _duplicate_key_diagnostic(exc: Exception) -> str:
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict):
+        details = {}
+    key_pattern = details.get("keyPattern")
+    key_value = details.get("keyValue")
+    if isinstance(key_pattern, dict):
+        pattern_text = repr(list(key_pattern.items()))
+    else:
+        pattern_text = "<unavailable>"
+    if isinstance(key_value, dict):
+        def safe_key_value(key, value):
+            if key not in {"account_id", "telegram_user_id", "_id"}:
+                return "<redacted>"
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+            if isinstance(value, str) and value.isdecimal():
+                return value
+            if key == "_id" and type(value).__name__ == "ObjectId":
+                return str(value)
+            return "<redacted>"
+
+        safe_values = {
+            key: safe_key_value(key, value) for key, value in key_value.items()
+        }
+        value_text = repr(safe_values)
+    else:
+        value_text = "<unavailable>"
+    index_name = details.get("indexName") or details.get("index")
+    if not index_name:
+        match = re.search(r"\bindex:\s*([^\s]+)", str(details.get("errmsg", "")) or str(exc))
+        index_name = match.group(1).rstrip(",") if match else "<unavailable>"
+    index_name = re.sub(r"[^A-Za-z0-9_.$-]", "?", str(index_name))
+    return (
+        f"index={index_name}, keyPattern={pattern_text}, "
+        f"keyValue={value_text}"
+    )
+
+
 class AccountManager:
     def __init__(self):
         self.clients: dict[int, Client] = {}
         self.status: dict[int, str] = {}
         self._removing: set[int] = set()
+        self._registration_locks: dict[int, asyncio.Lock] = {}
         self.selected_account_id: int | None = None
         self._monitor_task: asyncio.Task | None = None
 
@@ -158,79 +241,141 @@ class AccountManager:
             if getattr(me, "is_bot", False):
                 raise AccountError("Only a Telegram user account StringSession can be added.")
             account_id = int(me.id)
-            stage = "MongoDB account lookup"
-            db = get_raw_db()
-            existing = await db.accounts.find_one({
-                "owner_id": OWNER_ID,
-                "account_id": account_id,
-            })
-            if existing and existing.get("active"):
-                raise DuplicateAccountError("This Telegram account is already connected.")
+            registration_lock = self._registration_locks.setdefault(
+                account_id, asyncio.Lock()
+            )
+            async with registration_lock:
+                stage = "MongoDB account lookup"
+                db = get_raw_db()
+                existing = await _find_account_record(db, account_id)
+                if existing:
+                    _validate_existing_account(existing, account_id)
 
-            now = datetime.now(timezone.utc)
-            record = {
-                "account_id": account_id,
-                "telegram_user_id": account_id,
-                "owner_id": OWNER_ID,
-                "name": " ".join(
+                record_name = " ".join(
                     value for value in (me.first_name, me.last_name) if value
-                ) or str(account_id),
-                "username": me.username or "",
-                "session_string": session_string.strip(),
-                "active": True,
-                "selected": False,
-                "created_at": (existing or {}).get("created_at", now),
-                "updated_at": now,
-            }
-            stage = "MongoDB account save"
-            if existing:
-                result = await db.accounts.update_one(
-                    {"_id": existing["_id"]},
-                    {
-                        "$set": record,
-                        "$unset": {"encrypted_session": ""},
-                    },
-                )
-                if not result.matched_count:
-                    raise RuntimeError("Account record was not matched for update.")
-            else:
-                result = await db.accounts.insert_one(record)
-                if not result.inserted_id:
-                    raise RuntimeError("MongoDB did not confirm the account insert.")
+                ) or str(account_id)
+                username = me.username or ""
+                existing_client = self.clients.get(account_id)
+                if existing_client and existing_client.is_connected:
+                    registered = False
+                else:
+                    now = datetime.now(timezone.utc)
+                    stage = "MongoDB account save"
+                    if existing:
+                        updates = {
+                            "account_id": account_id,
+                            "telegram_user_id": account_id,
+                            "name": record_name,
+                            "username": username,
+                            "session_string": session_string.strip(),
+                            "active": True,
+                            "updated_at": now,
+                        }
+                        if "owner_id" not in existing:
+                            updates["owner_id"] = OWNER_ID
+                        result = await db.accounts.update_one(
+                            {"_id": existing["_id"]},
+                            {"$set": updates},
+                        )
+                        if not result.matched_count:
+                            raise RuntimeError("Account record was not matched for update.")
+                    else:
+                        record = {
+                            "account_id": account_id,
+                            "telegram_user_id": account_id,
+                            "owner_id": OWNER_ID,
+                            "name": record_name,
+                            "username": username,
+                            "session_string": session_string.strip(),
+                            "active": True,
+                            "selected": False,
+                            "created_at": now,
+                            "updated_at": now,
+                        }
+                        try:
+                            await db.accounts.update_one(
+                                {"telegram_user_id": account_id},
+                                {"$setOnInsert": record},
+                                upsert=True,
+                            )
+                        except Exception as exc:
+                            if not isinstance(exc, DuplicateKeyError):
+                                raise
+                            log.error(
+                                "Duplicate key while saving Telegram account %s "
+                                "(%s).",
+                                account_id,
+                                _duplicate_key_diagnostic(exc),
+                            )
+                            existing = await _find_account_record(db, account_id)
+                            if not existing:
+                                raise
+                            _validate_existing_account(existing, account_id)
+                            result = await db.accounts.update_one(
+                                {"_id": existing["_id"]},
+                                {
+                                    "$set": {
+                                        "account_id": account_id,
+                                        "telegram_user_id": account_id,
+                                        "name": record_name,
+                                        "username": username,
+                                        "session_string": session_string.strip(),
+                                        "active": True,
+                                        "updated_at": now,
+                                        **(
+                                            {"owner_id": OWNER_ID}
+                                            if "owner_id" not in existing
+                                            else {}
+                                        ),
+                                    }
+                                },
+                            )
+                            if not result.matched_count:
+                                raise RuntimeError(
+                                    "Racing account record was not matched for update."
+                                ) from exc
+                        else:
+                            existing = await _find_account_record(db, account_id)
+                            if not existing:
+                                raise RuntimeError(
+                                    "MongoDB upsert completed without an account record."
+                                )
+                            _validate_existing_account(existing, account_id)
+                    stage = "account manager registration"
+                    self.clients[account_id] = client
+                    self.status[account_id] = "Connected"
+                    registered = True
 
-            stage = "account manager registration"
-            self.clients[account_id] = client
-            self.status[account_id] = "Connected"
-            registered = True
-            selection_warning = False
-            if select or self.selected_account_id is None:
-                stage = "account selection"
-                try:
-                    selection_warning = not await self.select_account(account_id)
-                except Exception as exc:
-                    selection_warning = True
-                    safe_code = getattr(exc, "code", None)
-                    diagnostic = f"exception_type={type(exc).__name__}"
-                    if isinstance(safe_code, int):
-                        diagnostic += f", code={safe_code}"
-                    log.error(
-                        "Account %s was saved and connected, but selection failed "
-                        "(%s).",
-                        account_id,
-                        diagnostic,
-                    )
-                if selection_warning:
-                    log.error(
-                        "Account %s was saved and connected, but selection was not "
-                        "confirmed.",
-                        account_id,
-                    )
-            return {
-                "account_id": account_id,
-                "name": record["name"],
-                "username": record["username"],
-                "selection_warning": selection_warning,
-            }
+                selection_warning = False
+                if select or self.selected_account_id is None:
+                    stage = "account selection"
+                    try:
+                        selection_warning = not await self.select_account(account_id)
+                    except Exception as exc:
+                        selection_warning = True
+                        safe_code = getattr(exc, "code", None)
+                        diagnostic = f"exception_type={type(exc).__name__}"
+                        if isinstance(safe_code, int):
+                            diagnostic += f", code={safe_code}"
+                        log.error(
+                            "Account %s was saved and connected, but selection failed "
+                            "(%s).",
+                            account_id,
+                            diagnostic,
+                        )
+                    if selection_warning:
+                        log.error(
+                            "Account %s was saved and connected, but selection was not "
+                            "confirmed.",
+                            account_id,
+                        )
+                return {
+                    "account_id": account_id,
+                    "name": record_name,
+                    "username": username,
+                    "selection_warning": selection_warning,
+                    "already_registered": bool(existing),
+                }
         except DuplicateAccountError:
             raise
         except AccountError as exc:
@@ -245,6 +390,8 @@ class AccountManager:
             diagnostic = f"exception_type={type(exc).__name__}"
             if isinstance(safe_code, int):
                 diagnostic += f", code={safe_code}"
+            if isinstance(exc, DuplicateKeyError):
+                diagnostic += f", {_duplicate_key_diagnostic(exc)}"
             log.error(
                 "Account addition failed during %s (%s%s).",
                 stage,
