@@ -13,7 +13,13 @@ def owner_only(handler):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_user or update.effective_user.id != OWNER_ID:
             return
-        if handler.__name__ in {"cmd_start", "cmd_help", "cmd_status"}:
+        if handler.__name__ in {
+            "cmd_start",
+            "cmd_help",
+            "cmd_status",
+            "cmd_startpromo",
+            "cmd_stoppromo",
+        }:
             await handler(update, context)
             return
         from core.accounts import account_manager

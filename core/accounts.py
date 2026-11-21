@@ -140,6 +140,43 @@ class AccountManager:
         self.selected_account_id: int | None = None
         self._monitor_task: asyncio.Task | None = None
 
+    @staticmethod
+    def _register_membership_updates(client: Client, account_id: int) -> None:
+        if not callable(getattr(client, "add_handler", None)):
+            return
+        try:
+            from handlers.sync_groups import register_membership_updates
+
+            register_membership_updates(client, account_id)
+        except Exception as exc:
+            log.error(
+                "Could not register membership updates for account %s (%s).",
+                account_id,
+                type(exc).__name__,
+            )
+
+    async def _recover_account_promotion(self, account_id: int) -> None:
+        from database import db as database
+
+        if database is None:
+            return
+        try:
+            with account_context(account_id):
+                account_db = get_db(account_id)
+                state = await account_db.state.find_one({"key": "promotion_running"})
+                if not state or not state.get("value"):
+                    return
+                from core.bot import bot_app
+                from core.promotion import restore_state
+
+                await restore_state(bot_app.bot, account_id)
+        except Exception as exc:
+            log.exception(
+                "Could not recover promotion for reconnected account %s (%s).",
+                account_id,
+                type(exc).__name__,
+            )
+
     def get_client(self, account_id: int | None = None) -> Client:
         account_id = account_id or current_account_id() or self.selected_account_id
         if account_id is None:
@@ -200,6 +237,7 @@ class AccountManager:
                     continue
                 self.clients[account_id] = client
                 self.status[account_id] = "Connected"
+                self._register_membership_updates(client, account_id)
             except Exception as exc:
                 self.status[account_id] = "Disconnected"
                 log.error(
@@ -344,6 +382,7 @@ class AccountManager:
                     stage = "account manager registration"
                     self.clients[account_id] = client
                     self.status[account_id] = "Connected"
+                    self._register_membership_updates(client, account_id)
                     registered = True
 
                 selection_warning = False
@@ -547,6 +586,8 @@ class AccountManager:
                 return False
             self.clients[account_id] = client
             self.status[account_id] = "Connected"
+            self._register_membership_updates(client, account_id)
+            await self._recover_account_promotion(account_id)
             return True
         except Exception:
             self.status[account_id] = "Disconnected"

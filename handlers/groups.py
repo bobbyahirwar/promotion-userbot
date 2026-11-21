@@ -33,16 +33,24 @@ async def scan_and_store() -> tuple[int, int]:
     total_found = len(group_ids)
     to_store = group_ids[:MAX_GROUPS]
 
-    await db.groups.delete_many({})
-    if to_store:
-        await db.groups.insert_many([{"chat_id": gid} for gid in to_store])
+    for chat_id in to_store:
+        await db.groups.update_one(
+            {"chat_id": chat_id},
+            {"$set": {
+                "chat_id": chat_id,
+                "active": True,
+                "membership_status": "member",
+                "promotion_authorized": True,
+            }},
+            upsert=True,
+        )
 
     return total_found, len(to_store)
 
 
 # ── Startup validator ─────────────────────────────────────────────────────────
 
-# Errors that mean the group is permanently inaccessible — remove it from DB.
+# Errors that mean the group is no longer accessible to this account.
 _INVALID_PEER_ERRORS = (
     PeerIdInvalid,
     ChannelPrivate,
@@ -54,8 +62,8 @@ _INVALID_PEER_ERRORS = (
 async def validate_and_clean_groups() -> tuple[int, int]:
     """
     Called once at startup (after userbot connects and DB is ready).
-    Checks every stored group with get_chat(); removes any that are
-    permanently inaccessible.  Never raises — always returns normally.
+    Checks every stored group with get_chat(); marks inaccessible groups
+    inactive without deleting their historical records.
 
     Returns (kept, removed).
     """
@@ -71,13 +79,17 @@ async def validate_and_clean_groups() -> tuple[int, int]:
             await userbot.get_chat(chat_id)
             kept += 1
         except _INVALID_PEER_ERRORS as e:
-            await db.groups.delete_one({"chat_id": chat_id})
-            print(f"   🗑️  Removed invalid group {chat_id}: {type(e).__name__}")
+            from handlers.sync_groups import mark_membership_inactive
+
+            await mark_membership_inactive(chat_id, type(e).__name__)
+            print(f"   🚫 Marked inaccessible group {chat_id}: {type(e).__name__}")
             removed += 1
         except ValueError:
             # Some IDs surface as plain ValueError before reaching Pyrogram
-            await db.groups.delete_one({"chat_id": chat_id})
-            print(f"   🗑️  Removed invalid group {chat_id}: ValueError")
+            from handlers.sync_groups import mark_membership_inactive
+
+            await mark_membership_inactive(chat_id, "ValueError")
+            print(f"   🚫 Marked inaccessible group {chat_id}: ValueError")
             removed += 1
         except Exception:
             # Temporary error (FloodWait, network, etc.) — keep the group

@@ -19,6 +19,11 @@ async def get_inactive_ids() -> set:
 async def mark_inactive(chat_id: int, reason: str) -> None:
     """Upsert a group as inactive, storing the error reason and timestamp."""
     db = get_db()
+    await db.groups.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"chat_id": chat_id, "active": False}},
+        upsert=True,
+    )
     await db.inactive_groups.update_one(
         {"chat_id": chat_id},
         {"$set": {
@@ -35,13 +40,24 @@ async def _reactivate_one(chat_id: int) -> bool:
     """Delete a single group from the inactive collection. Returns True if found."""
     db = get_db()
     result = await db.inactive_groups.delete_one({"chat_id": chat_id})
+    if result.deleted_count:
+        await db.groups.update_one(
+            {"chat_id": chat_id},
+            {"$set": {"active": True}},
+        )
     return result.deleted_count > 0
 
 
 async def _reactivate_all() -> int:
     """Delete all inactive groups. Returns the number removed."""
     db = get_db()
+    inactive = await db.inactive_groups.find({}, {"chat_id": 1}).to_list(None)
     result = await db.inactive_groups.delete_many({})
+    if inactive:
+        await db.groups.update_many(
+            {"chat_id": {"$in": [doc["chat_id"] for doc in inactive]}},
+            {"$set": {"active": True}},
+        )
     return result.deleted_count
 
 

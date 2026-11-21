@@ -4,6 +4,7 @@ import logging
 import random
 from datetime import datetime, timedelta, timezone
 
+from pyrogram.enums import ChatType
 from pyrogram.errors import (
     FloodWait,
     SlowmodeWait,           # correct Pyrogram name (lowercase 'm')
@@ -15,17 +16,15 @@ from pyrogram.errors import (
     UserNotParticipant,
 )
 
-# Permanent permission errors that should deactivate a group.
-# Temporary errors (FloodWait, SlowmodeWait, ChatWriteForbidden, network)
-# are NOT listed here — they are retried on the next cycle.
-_PERMANENT_ERRORS = (
-    ChatWriteForbidden,
+# Errors that mean this account is no longer a member of its group.
+_MEMBERSHIP_ERRORS = (
     UserBannedInChannel,
     PeerIdInvalid,
-    ChatAdminRequired,
     ChannelPrivate,
     UserNotParticipant,
 )
+_PERMISSION_ERRORS = (ChatWriteForbidden, ChatAdminRequired)
+_SYNC_INTERVAL_SECONDS = 60
 
 from config import (
     PROMOTION_INTERVAL_SECONDS,
@@ -48,7 +47,9 @@ from core.userbot import userbot
 from core.account_context import account_context, current_account_id
 
 _tasks: dict[int, asyncio.Task] = {}
+_sync_tasks: dict[int, asyncio.Task] = {}
 _running: dict[int, bool] = {}
+_lifecycle_locks: dict[int, asyncio.Lock] = {}
 log = logging.getLogger(__name__)
 
 _DECORATIVE_SYMBOLS = tuple("™®©=∆×÷π•|`~¥^°{}%✓<>*\"':;!?/)(+-&_#@")
@@ -364,6 +365,76 @@ async def _clear_safety_pause(db):
 FLOODWAIT_SAFETY_BUFFER_SECONDS = 5
 
 
+async def _check_group_eligibility(db, group: dict, account_id: int) -> tuple[str, str]:
+    """Recheck account-scoped authorization, membership, and posting rights."""
+    chat_id = group["chat_id"]
+    stored = await db.groups.find_one({"chat_id": chat_id})
+    if (
+        not stored
+        or stored.get("active") is False
+        or await db.blacklist.find_one({"chat_id": chat_id})
+        or await db.inactive_groups.find_one({"chat_id": chat_id})
+    ):
+        return "skipped", "Group is inactive or not managed by this account"
+
+    slowmode_key = f"promotion_slowmode_until:{chat_id}"
+    slowmode_doc = await db.state.find_one({"key": slowmode_key})
+    slowmode_until = _normalize_datetime((slowmode_doc or {}).get("value"))
+    if slowmode_until and slowmode_until > datetime.now(timezone.utc):
+        return "skipped", "Slowmode cooldown is active"
+    if slowmode_doc:
+        await db.state.delete_one({"key": slowmode_key})
+
+    try:
+        chat = await userbot.get_chat(chat_id)
+        member = await userbot.get_chat_member(chat_id, account_id)
+    except _MEMBERSHIP_ERRORS as exc:
+        from handlers.sync_groups import mark_membership_inactive
+
+        await mark_membership_inactive(chat_id, type(exc).__name__)
+        return "inactive", type(exc).__name__
+    except _PERMISSION_ERRORS as exc:
+        return "skipped", type(exc).__name__
+    except ValueError as exc:
+        if "peer id invalid" in str(exc).lower() or "peer_id_invalid" in str(exc).lower():
+            from handlers.sync_groups import mark_membership_inactive
+
+            await mark_membership_inactive(chat_id, "PeerIdInvalid")
+            return "inactive", "PeerIdInvalid"
+        raise
+
+    status = getattr(member.status, "value", member.status)
+    status = str(status).upper().rsplit(".", 1)[-1]
+    if status in {"LEFT", "BANNED"} or status not in {
+        "MEMBER",
+        "ADMINISTRATOR",
+        "OWNER",
+        "RESTRICTED",
+    } or (
+        status == "RESTRICTED"
+        and getattr(member, "is_member", True) is False
+    ):
+        from handlers.sync_groups import mark_membership_inactive
+
+        reason = status.lower() if status in {"LEFT", "BANNED"} else "not_a_member"
+        await mark_membership_inactive(chat_id, reason)
+        return "inactive", reason
+
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return "skipped", "Chat is not a group or supergroup"
+
+    permissions = getattr(chat, "permissions", None)
+    if permissions and getattr(permissions, "can_send_messages", True) is False:
+        return "skipped", "Group does not allow sending messages"
+    if (
+        getattr(member, "can_send_messages", None) is False
+        or getattr(member, "can_post_messages", None) is False
+    ):
+        return "skipped", "Account lacks posting permissions"
+
+    return "eligible", ""
+
+
 async def _trigger_floodwait_cooldown(
     db,
     flood_wait_seconds: int,
@@ -599,7 +670,8 @@ async def _clear_promotion_rest(db):
 
 async def _loop(bot, account_id: int):
     try:
-        await _run_account_loop(bot, account_id)
+        with account_context(account_id):
+            await _run_account_loop(bot, account_id)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -612,6 +684,22 @@ async def _loop(bot, account_id: int):
                 {"$set": {"value": False}},
                 upsert=True,
             )
+
+
+async def _membership_sync_loop(account_id: int) -> None:
+    from handlers.sync_groups import sync_joined_groups
+
+    while _running.get(account_id, False):
+        await asyncio.sleep(_SYNC_INTERVAL_SECONDS)
+        if not _running.get(account_id, False):
+            break
+        try:
+            with account_context(account_id):
+                await sync_joined_groups()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Group membership reconciliation failed for account %s.", account_id)
 
 
 async def _run_account_loop(bot, account_id: int):
@@ -713,12 +801,16 @@ async def _run_account_loop(bot, account_id: int):
 
         # ── Blacklist + inactive filter ──────────────────────────────────────
         from handlers.blacklist import get_blacklisted_ids
-        from handlers.inactive_groups import get_inactive_ids, mark_inactive
+        from handlers.inactive_groups import get_inactive_ids
 
         blacklisted = await get_blacklisted_ids()
         inactive    = await get_inactive_ids()
         excluded    = blacklisted | inactive
-        active_groups = [g for g in groups if g["chat_id"] not in excluded]
+        active_groups = [
+            group for group in groups
+            if group["chat_id"] not in excluded
+            and group.get("active") is not False
+        ]
 
         total_groups = len(active_groups)
         if total_groups == 0:
@@ -820,8 +912,20 @@ async def _run_account_loop(bot, account_id: int):
             error_detail = ""
 
             try:
-                await _send_one(bot, chat_id, current_msg, used_variations)
-                await _inc_stat(db, "total_sent")
+                eligibility, eligibility_detail = await _check_group_eligibility(
+                    db, group, account_id
+                )
+                if eligibility == "inactive":
+                    group_result = "inactive"
+                    error_detail = eligibility_detail
+                    deactivated += 1
+                elif eligibility == "skipped":
+                    group_result = "skipped"
+                    error_detail = eligibility_detail
+                    skipped += 1
+                else:
+                    await _send_one(bot, chat_id, current_msg, used_variations)
+                    await _inc_stat(db, "total_sent")
 
             except FloodWait as e:
                 # REAL TELEGRAM FLOODWAIT:
@@ -889,7 +993,14 @@ async def _run_account_loop(bot, account_id: int):
             except SlowmodeWait as e:
                 # Temporary — count it toward the consecutive-error safety check,
                 # but do not deactivate the group or retry it in the same cycle.
-                wait_time = getattr(e, "value", 30)
+                wait_time = max(0, int(getattr(e, "value", 30) or 0))
+                await db.state.update_one(
+                    {"key": f"promotion_slowmode_until:{chat_id}"},
+                    {"$set": {
+                        "value": datetime.now(timezone.utc) + timedelta(seconds=wait_time + 1),
+                    }},
+                    upsert=True,
+                )
                 error_detail = f"SlowmodeWait {wait_time} seconds"
                 print(f"  ⚠️  SlowmodeWait {wait_time}s on {name} — counting as temporary failure")
                 await _inc_stat(db, "total_failed")
@@ -926,12 +1037,18 @@ async def _run_account_loop(bot, account_id: int):
                     cooldown_triggered = True
                     break
 
-            except _PERMANENT_ERRORS as e:
-                # Permanent permission error — deactivate immediately so the
-                # group is excluded from every future cycle.
+            except _PERMISSION_ERRORS as e:
+                # Permission failures are skipped but may be resolved by an owner.
+                error_detail = type(e).__name__
+                group_result = "skipped"
+                skipped += 1
+
+            except _MEMBERSHIP_ERRORS as e:
                 error_detail = type(e).__name__
                 await _inc_stat(db, "total_failed")
-                await mark_inactive(chat_id, error_detail)
+                from handlers.sync_groups import mark_membership_inactive
+
+                await mark_membership_inactive(chat_id, error_detail)
                 group_result = "inactive"
                 deactivated += 1
 
@@ -943,7 +1060,9 @@ async def _run_account_loop(bot, account_id: int):
                 if "peer id invalid" in err_str or "peer_id_invalid" in err_str:
                     error_detail = f"PeerIdInvalid: {e}"
                     await _inc_stat(db, "total_failed")
-                    await mark_inactive(chat_id, f"PeerIdInvalid(ValueError): {e}")
+                    from handlers.sync_groups import mark_membership_inactive
+
+                    await mark_membership_inactive(chat_id, f"PeerIdInvalid(ValueError): {e}")
                     group_result = "inactive"
                     deactivated += 1
                 else:
@@ -1259,18 +1378,33 @@ def _resolve_account_id(account_id: int | None = None) -> int:
 
 async def start_promotion(bot, account_id: int | None = None):
     account_id = _resolve_account_id(account_id)
-    task = _tasks.get(account_id)
-    if _running.get(account_id, False) and task is not None and not task.done():
-        return
-    _running[account_id] = True
-    with account_context(account_id):
-        db = get_db()
-        await db.state.update_one(
-            {"key": "promotion_running"},
-            {"$set": {"value": True}},
-            upsert=True,
-        )
-        _tasks[account_id] = asyncio.create_task(_loop(bot, account_id))
+    lock = _lifecycle_locks.setdefault(account_id, asyncio.Lock())
+    async with lock:
+        task = _tasks.get(account_id)
+        if task is not None and not task.done():
+            return False
+        with account_context(account_id):
+            from handlers.sync_groups import sync_joined_groups
+
+            await sync_joined_groups()
+            db = get_db()
+            await db.state.update_one(
+                {"key": "promotion_running"},
+                {"$set": {"value": True}},
+                upsert=True,
+            )
+            _running[account_id] = True
+            sync_task = _sync_tasks.get(account_id)
+            if sync_task is None or sync_task.done():
+                _sync_tasks[account_id] = asyncio.create_task(
+                    _membership_sync_loop(account_id),
+                    name=f"group-sync-{account_id}",
+                )
+            _tasks[account_id] = asyncio.create_task(
+                _loop(bot, account_id),
+                name=f"promotion-{account_id}",
+            )
+        return True
 
 
 async def stop_promotion(
@@ -1278,34 +1412,36 @@ async def stop_promotion(
     preserve_state: bool = False,
 ):
     account_id = _resolve_account_id(account_id)
-    _running[account_id] = False
-    task = _tasks.get(account_id)
-    if task and not task.done():
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    _tasks.pop(account_id, None)
-    with account_context(account_id):
-        db = get_db()
-        await db.state.update_one(
-            {"key": "promotion_running"},
-            {"$set": {"value": False}},
-            upsert=True,
-        )
-        if not preserve_state:
-            await db.state.delete_many({
-                "key": {
-                    "$in": [
-                        "promotion_group_cursor",
-                        "promotion_cycle_stats",
-                        "promotion_continuous_runtime_seconds",
-                        "promotion_continuous_runtime_active_since",
-                        "promotion_rest_until",
-                    ]
-                }
-            })
+    lock = _lifecycle_locks.setdefault(account_id, asyncio.Lock())
+    async with lock:
+        _running[account_id] = False
+        tasks = [task for task in (_tasks.get(account_id), _sync_tasks.get(account_id)) if task]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        _tasks.pop(account_id, None)
+        _sync_tasks.pop(account_id, None)
+        with account_context(account_id):
+            db = get_db()
+            await db.state.update_one(
+                {"key": "promotion_running"},
+                {"$set": {"value": False}},
+                upsert=True,
+            )
+            if not preserve_state:
+                await db.state.delete_many({
+                    "key": {
+                        "$in": [
+                            "promotion_group_cursor",
+                            "promotion_cycle_stats",
+                            "promotion_continuous_runtime_seconds",
+                            "promotion_continuous_runtime_active_since",
+                            "promotion_rest_until",
+                        ]
+                    }
+                })
 
 
 def is_running(account_id: int | None = None) -> bool:
@@ -1335,13 +1471,18 @@ async def _restore_account_state(bot, account_id: int):
 
 async def shutdown() -> None:
     tasks = list(_tasks.items())
+    sync_tasks = list(_sync_tasks.items())
     for account_id, task in tasks:
         _running[account_id] = False
         if not task.done():
             task.cancel()
-    if tasks:
+    for _, task in sync_tasks:
+        if not task.done():
+            task.cancel()
+    if tasks or sync_tasks:
         await asyncio.gather(
-            *(task for _, task in tasks),
+            *(task for _, task in tasks + sync_tasks),
             return_exceptions=True,
         )
     _tasks.clear()
+    _sync_tasks.clear()

@@ -1,28 +1,64 @@
+import logging
+
 from telegram import Update
 from telegram.ext import ContextTypes, CommandHandler
 from handlers.admin import owner_only
 from core import promotion
+from core.accounts import account_manager
 from database import get_db
+
+_log = logging.getLogger(__name__)
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 @owner_only
 async def cmd_startpromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if promotion.is_running():
-        await update.message.reply_text("⚠️ Promotion is already running.")
+    records = await account_manager.list_accounts()
+    if not records:
+        await update.message.reply_text("No Telegram accounts are configured.")
         return
-    await promotion.start_promotion(context.bot)
-    await update.message.reply_text("✅ Promotion Started.")
+    statuses = ["Promotion status by account:"]
+    for record in records:
+        account_id = int(record["account_id"])
+        client = account_manager.clients.get(account_id)
+        name = record.get("name") or record.get("first_name") or str(account_id)
+        if not client or not client.is_connected:
+            statuses.append(f"• {name} ({account_id}): Disconnected — not started")
+            continue
+        try:
+            started = await promotion.start_promotion(context.bot, account_id)
+        except Exception as exc:
+            _log.exception("Could not start promotion for account %s.", account_id)
+            statuses.append(
+                f"• {name} ({account_id}): Failed to start ({type(exc).__name__})"
+            )
+        else:
+            state = "Started" if started else "Already running"
+            statuses.append(f"• {name} ({account_id}): {state}")
+    await update.message.reply_text("\n".join(statuses))
 
 
 @owner_only
 async def cmd_stoppromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not promotion.is_running():
-        await update.message.reply_text("⚠️ Promotion is not running.")
+    records = await account_manager.list_accounts()
+    if not records:
+        await update.message.reply_text("No Telegram accounts are configured.")
         return
-    await promotion.stop_promotion()
-    await update.message.reply_text("🔴 Promotion Stopped.")
+    statuses = ["Promotion status by account:"]
+    for record in records:
+        account_id = int(record["account_id"])
+        name = record.get("name") or record.get("first_name") or str(account_id)
+        try:
+            was_running = promotion.is_running(account_id)
+            await promotion.stop_promotion(account_id)
+        except Exception as exc:
+            _log.exception("Could not stop promotion for account %s.", account_id)
+            statuses.append(f"• {name} ({account_id}): Failed to stop ({type(exc).__name__})")
+        else:
+            state = "Stopped" if was_running else "Already stopped"
+            statuses.append(f"• {name} ({account_id}): {state}")
+    await update.message.reply_text("\n".join(statuses))
 
 
 @owner_only
